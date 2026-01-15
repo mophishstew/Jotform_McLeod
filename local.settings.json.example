@@ -1,0 +1,23 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "node",
+    "MCLEOD_API_URL": "https://mcleod.yourcompany.com/webservices",
+    "MCLEOD_USERNAME": "api_service_user",
+    "MCLEOD_PASSWORD": "your_secure_password",
+    "MCLEOD_TIMEOUT": "30000",
+    "JOTFORM_API_KEY": "your_jotform_api_key",
+    "JOTFORM_WEBHOOK_SECRET": "your_webhook_secret",
+    "SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/xxx/yyy/zzz",
+    "ENABLE_SLACK_ALERTS": "true",
+    "AZURE_STORAGE_CONNECTION_STRING": "",
+    "AZURE_STORAGE_CONTAINER": "customer-agreements",
+    "ENABLE_DOCUMENT_UPLOAD": "true",
+    "ENABLE_WEBHOOK_VALIDATION": "true",
+    "LOG_LEVEL": "info"
+  },
+  "Host": {
+    "CORS": "*"
+  }
+}
