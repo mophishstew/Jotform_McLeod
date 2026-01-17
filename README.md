@@ -187,8 +187,15 @@ Three modes supported:
 
 ### Customer Matching Logic
 
-1. **Primary:** Search by EIN (`customer.federal_id`)
-2. **Fallback:** Search by name + city + state
+The integration uses a multi-step matching strategy based on verified working endpoints:
+
+1. **Deterministic ID Lookup:** `GET /customers?q={customerId}` - Checks if the generated customer ID already exists
+2. **Name + Address Search:** `GET /customers/search?customer.name=...&customer.city=...&customer.state_id=...`
+3. **General Query Fallback:** `GET /customers?q={legalName}` with city/state verification
+
+**NOTE:** EIN matching via `customer.federal_id` is disabled until the field is verified in `GET /customers/new`.
+
+**IMPORTANT:** McLeod uses `state_id` (not `state`) based on verified live response.
 
 If found → UPDATE. If not found → CREATE.
 
@@ -239,12 +246,13 @@ Before production deployment, validate these scenarios:
 - [ ] **Test 3:** Verify 401 triggers token refresh and retry
 
 ### Customer Operations
-- [ ] **Test 4:** `GET /customers/new` returns valid RowCustomer template
-- [ ] **Test 5:** Search by EIN returns matching customer
-- [ ] **Test 6:** Search by name+city+state returns matching customer
+- [ ] **Test 4:** `GET /customers/new` returns valid RowCustomer template - check for federal_id field
+- [ ] **Test 5:** `GET /customers?q={customerId}` returns matching customer (deterministic ID lookup)
+- [ ] **Test 6:** Search by name+city+state_id returns matching customer
 - [ ] **Test 7:** `PUT /customers/create` successfully creates new customer
 - [ ] **Test 8:** `PUT /customers/update` preserves credit if already Approved (A)
 - [ ] **Test 9:** Verify credit_limit=0 and credit_status=T on new customers
+- [ ] **Test 9a:** Verify EIN field name in /customers/new response (to enable EIN matching later)
 
 ### Contact Operations
 - [ ] **Test 10:** `PUT /contacts/create` successfully creates Logistics contact

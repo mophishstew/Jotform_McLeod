@@ -279,6 +279,32 @@ export class McLeodClient {
   }
 
   /**
+   * GET /customers?q={query} - Search customers by general query
+   * This is the confirmed working endpoint for searching by customer ID or name
+   * Use this for deterministic ID lookups and name-based searches
+   */
+  async searchCustomersByQuery(query: string): Promise<CustomerSearchResult> {
+    const op = logger.startOperation('mcleod_search_customers_by_query');
+    try {
+      const endpoint = `/customers?q=${encodeURIComponent(query)}`;
+      const result = await this.request<RowCustomer[]>('GET', endpoint);
+
+      // Response is typically an array of customers
+      const customers = Array.isArray(result) ? result : [];
+
+      op.end(true, undefined, { query, count: customers.length });
+      return {
+        customers,
+        totalCount: customers.length,
+        hasMore: false,
+      };
+    } catch (error) {
+      op.end(false, error instanceof Error ? error.message : 'Unknown error');
+      throw error;
+    }
+  }
+
+  /**
    * GET /customers/{id} - Get customer by ID
    */
   async getCustomerById(customerId: string): Promise<RowCustomer | null> {
@@ -470,7 +496,7 @@ export class McLeodClient {
           'Accept': 'application/json',
           ...(this.companyId && { 'X-Company-Id': this.companyId }),
         },
-        body: pdfBuffer,
+        body: new Uint8Array(pdfBuffer),  // Convert Buffer to Uint8Array for fetch compatibility
         signal: AbortSignal.timeout(this.timeout * 2), // Longer timeout for uploads
       });
 
@@ -516,24 +542,18 @@ export class McLeodClient {
 
   /**
    * Find customer by EIN (legacy interface)
+   * NOTE: Disabled until federal_id field is verified in GET /customers/new
    */
-  async findCustomerByEIN(ein: string): Promise<McLeodCustomer | null> {
-    try {
-      const result = await this.searchCustomers({ 'customer.federal_id': ein });
-      if (result.customers.length === 0) {
-        return null;
-      }
-
-      // Return first match, converted to legacy format
-      return this.rowToLegacyCustomer(result.customers[0]);
-    } catch (error) {
-      logger.warn('find_customer_by_ein_failed', error instanceof Error ? error.message : 'Unknown');
-      return null;
-    }
+  async findCustomerByEIN(_ein: string): Promise<McLeodCustomer | null> {
+    // EIN matching disabled until field is verified
+    // TODO: Re-enable once federal_id field name is confirmed via GET /customers/new
+    logger.warn('find_customer_by_ein_disabled', 'EIN matching disabled - field not yet verified');
+    return null;
   }
 
   /**
    * Find customer by name and address (legacy interface)
+   * Uses state_id instead of state per verified live response
    */
   async findCustomerByNameAddress(
     name: string,
@@ -544,7 +564,7 @@ export class McLeodClient {
       const result = await this.searchCustomers({
         'customer.name': name,
         'customer.city': city,
-        'customer.state': state,
+        'customer.state_id': state,  // NOTE: McLeod uses state_id, not state
       });
 
       if (result.customers.length === 0) {
@@ -666,7 +686,7 @@ export class McLeodClient {
       address1: row.address1,
       address2: row.address2,
       city: row.city,
-      state: row.state,
+      state_id: row.state_id,  // NOTE: McLeod uses state_id, not state
       zip_code: row.zip_code,
       phone: row.phone1,
       phone2: row.phone2,

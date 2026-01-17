@@ -19,7 +19,7 @@ export interface RowCustomer {
   address1: string;                // Street address (required)
   address2?: string;               // Street address line 2
   city: string;                    // City (required)
-  state: string;                   // 2-letter state code (required)
+  state_id: string;                // 2-letter state code (required) - NOTE: McLeod uses state_id, not state
   zip_code: string;                // Postal code (required)
   country_code?: string;           // Country code (default: USA)
 
@@ -105,10 +105,11 @@ export interface RowComment {
  * Use prefixes like customer.* or no prefix per docs
  */
 export interface CustomerSearchParams {
-  'customer.federal_id'?: string;
+  // NOTE: federal_id field not yet verified - do not use for matching until confirmed
+  // 'customer.federal_id'?: string;
   'customer.name'?: string;
   'customer.city'?: string;
-  'customer.state'?: string;
+  'customer.state_id'?: string;  // NOTE: McLeod uses state_id, not state
   'customer.zip_code'?: string;
   'customer.id'?: string;
   // Allow string params for query building
@@ -142,7 +143,7 @@ export interface McLeodCustomer {
   address1: string;
   address2?: string;
   city: string;
-  state: string;
+  state_id: string;  // NOTE: McLeod uses state_id, not state
   zip_code: string;
   phone?: string;
   phone2?: string;
@@ -182,9 +183,9 @@ export interface McLeodCustomer {
 export interface McLeodSearchCriteria {
   id?: string;
   name?: string;
-  federal_id?: string;
+  // federal_id?: string;  // Not yet verified - do not use until confirmed
   city?: string;
-  state?: string;
+  state_id?: string;  // NOTE: McLeod uses state_id, not state
   zip_code?: string;
   phone?: string;
   email?: string;

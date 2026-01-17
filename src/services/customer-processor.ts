@@ -7,11 +7,17 @@
  * MVP Flow:
  * 1. Receive normalized submission
  * 2. Check idempotency
- * 3. Search for existing customer (by EIN, then by name+city+state)
+ * 3. Search for existing customer:
+ *    a) First: deterministic customer ID lookup (GET /customers?q={customerId})
+ *    b) Fallback: name + city + state_id search
+ *    c) Last resort: general query by legal name
+ *    NOTE: EIN matching disabled until federal_id field is verified
  * 4. Create or update customer in McLeod
  * 5. Create contacts (Logistics + AP)
  * 6. Upload agreement PDF
  * 7. Add "PENDING CREDIT APPROVAL" comment
+ *
+ * IMPORTANT: Uses state_id (not state) per verified live McLeod response
  */
 
 import { getSalespersonId, isSalespersonFound, getConfig } from '../config/index.js';
@@ -165,6 +171,12 @@ export async function processSubmission(
 
 /**
  * Find existing customer or create new one
+ *
+ * Matching strategy (per verified working endpoints):
+ * 1. First try deterministic customer ID lookup via GET /customers?q={customerId}
+ * 2. Fallback to name + city + state_id search
+ *
+ * NOTE: EIN matching is disabled until federal_id field is verified in GET /customers/new
  */
 async function findOrCreateCustomer(
   submission: NormalizedSubmission,
@@ -172,44 +184,49 @@ async function findOrCreateCustomer(
 ): Promise<{ customerId: string; created: boolean }> {
   const mcleodClient = getMcLeodClient();
 
-  // Try to find by EIN first (most reliable)
-  log.info('searching_by_ein', { ein: submission.company.ein });
+  // Generate the deterministic customer ID we would use for creation
+  const baseId = generateCustomerId(submission.company.ein, submission.company.legalName);
+
+  // Strategy 1: Try deterministic customer ID lookup first
+  // This checks if a customer with this exact ID already exists
+  log.info('searching_by_deterministic_id', { customerId: baseId });
 
   try {
-    const einResult = await mcleodClient.searchCustomers({
-      'customer.federal_id': submission.company.ein,
-    });
+    const idResult = await mcleodClient.searchCustomersByQuery(baseId);
 
-    if (einResult.customers.length > 0) {
-      const existing = einResult.customers[0];
-      log.info('customer_found_by_ein', {
-        mcleodCustomerId: existing.id,
-        ein: submission.company.ein,
-      });
+    if (idResult.customers.length > 0) {
+      // Look for exact ID match
+      const exactIdMatch = idResult.customers.find((c) => c.id === baseId);
 
-      await updateExistingCustomer(existing.id!, submission, log);
-      return { customerId: existing.id!, created: false };
+      if (exactIdMatch) {
+        log.info('customer_found_by_deterministic_id', {
+          mcleodCustomerId: exactIdMatch.id,
+        });
+
+        await updateExistingCustomer(exactIdMatch.id!, submission, log);
+        return { customerId: exactIdMatch.id!, created: false };
+      }
     }
   } catch (searchError) {
-    log.warn('ein_search_failed', searchError instanceof Error ? searchError.message : 'Unknown');
+    log.warn('deterministic_id_search_failed', searchError instanceof Error ? searchError.message : 'Unknown');
   }
 
-  // Fallback: search by name + city + state
+  // Strategy 2: Fallback to name + city + state_id search
   log.info('searching_by_name_address', {
     name: submission.company.legalName,
     city: submission.company.address.city,
-    state: submission.company.address.state,
+    state_id: submission.company.address.state,
   });
 
   try {
     const nameResult = await mcleodClient.searchCustomers({
       'customer.name': submission.company.legalName,
       'customer.city': submission.company.address.city,
-      'customer.state': submission.company.address.state,
+      'customer.state_id': submission.company.address.state,
     });
 
     if (nameResult.customers.length > 0) {
-      // Find exact match
+      // Find exact name match
       const normalizedName = submission.company.legalName.toUpperCase().replace(/[^A-Z0-9]/g, '');
       const exactMatch = nameResult.customers.find((c) => {
         const customerName = (c.name || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -230,7 +247,38 @@ async function findOrCreateCustomer(
     log.warn('name_search_failed', searchError instanceof Error ? searchError.message : 'Unknown');
   }
 
-  // Create new customer
+  // Strategy 3: Try general query search by legal name as last resort
+  log.info('searching_by_query_name', { name: submission.company.legalName });
+
+  try {
+    const queryResult = await mcleodClient.searchCustomersByQuery(submission.company.legalName);
+
+    if (queryResult.customers.length > 0) {
+      // Find exact name match in results
+      const normalizedName = submission.company.legalName.toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const exactMatch = queryResult.customers.find((c) => {
+        const customerName = (c.name || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+        // Also check city and state for disambiguation
+        const cityMatch = (c.city || '').toUpperCase() === submission.company.address.city.toUpperCase();
+        const stateMatch = (c.state_id || '') === submission.company.address.state;
+        return customerName === normalizedName && cityMatch && stateMatch;
+      });
+
+      if (exactMatch) {
+        log.info('customer_found_by_query_name', {
+          mcleodCustomerId: exactMatch.id,
+          name: submission.company.legalName,
+        });
+
+        await updateExistingCustomer(exactMatch.id!, submission, log);
+        return { customerId: exactMatch.id!, created: false };
+      }
+    }
+  } catch (searchError) {
+    log.warn('query_name_search_failed', searchError instanceof Error ? searchError.message : 'Unknown');
+  }
+
+  // No existing customer found - create new
   log.info('creating_new_customer', {
     name: submission.company.legalName,
     ein: submission.company.ein,
@@ -260,7 +308,7 @@ async function createNewCustomer(
       name: '',
       address1: '',
       city: '',
-      state: '',
+      state_id: '',  // NOTE: McLeod uses state_id, not state
       zip_code: '',
     };
   }
@@ -298,7 +346,7 @@ async function createNewCustomer(
     address1: submission.company.address.street,
     address2: submission.company.address.street2 || undefined,
     city: submission.company.address.city.toUpperCase(),
-    state: submission.company.address.state,
+    state_id: submission.company.address.state,  // NOTE: McLeod uses state_id, not state
     zip_code: submission.company.address.zip,
     country_code: 'USA',
 
@@ -375,7 +423,7 @@ async function updateExistingCustomer(
     address1: submission.company.address.street,
     address2: submission.company.address.street2 || undefined,
     city: submission.company.address.city.toUpperCase(),
-    state: submission.company.address.state,
+    state_id: submission.company.address.state,  // NOTE: McLeod uses state_id, not state
     zip_code: submission.company.address.zip,
 
     // Add DBA if provided and not already set
