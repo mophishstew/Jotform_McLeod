@@ -2,26 +2,37 @@
  * Customer Processor Service
  *
  * Main business logic for processing Jotform submissions
- * and creating/updating customers in McLeod TMS
+ * and creating/updating customers in McLeod TMS via REST API.
+ *
+ * MVP Flow:
+ * 1. Receive normalized submission
+ * 2. Check idempotency
+ * 3. Search for existing customer (by EIN, then by name+city+state)
+ * 4. Create or update customer in McLeod
+ * 5. Create contacts (Logistics + AP)
+ * 6. Upload agreement PDF
+ * 7. Add "PENDING CREDIT APPROVAL" comment
  */
 
-import { getSalespersonId } from '../config/index.js';
+import { getSalespersonId, isSalespersonFound, getConfig } from '../config/index.js';
 import { getMcLeodClient } from './mcleod-client.js';
 import { getDocumentHandler } from './document-handler.js';
 import {
   logger,
   idempotencyStore,
   checkIdempotency,
+  generateContentHash,
   generateCustomerId,
   mapPaymentTerms,
   alertProcessingFailure,
   alertDocumentUploadFailure,
+  alertSalespersonNotFound,
 } from '../utils/index.js';
 import type {
   NormalizedSubmission,
-  McLeodCustomer,
   ProcessingResult,
 } from '../types/index.js';
+import type { RowCustomer, RowContact, RowComment } from '../types/mcleod.js';
 
 /**
  * Process a Jotform submission
@@ -35,8 +46,16 @@ export async function processSubmission(
   const op = log.startOperation('process_submission');
 
   try {
+    // Generate content hash for deduplication
+    const contentHash = generateContentHash(
+      submission.company.ein,
+      submission.company.legalName,
+      submission.company.address.city,
+      submission.company.address.state
+    );
+
     // Check idempotency
-    const idempotencyCheck = checkIdempotency(submission.submissionId);
+    const idempotencyCheck = await checkIdempotency(submission.submissionId);
 
     if (!idempotencyCheck.canProcess) {
       if (idempotencyCheck.existingCustomerId) {
@@ -58,56 +77,66 @@ export async function processSubmission(
     }
 
     // Start processing
-    if (!idempotencyStore.startProcessing(submission.submissionId)) {
+    const acquired = await idempotencyStore.startProcessing(submission.submissionId, contentHash);
+    if (!acquired) {
       throw new Error('Failed to acquire processing lock');
     }
 
     // Find or create customer
-    const { customer, created } = await findOrCreateCustomer(submission, log);
+    const { customerId, created } = await findOrCreateCustomer(submission, log);
+
+    // Create contacts (non-blocking failures)
+    await createContacts(customerId, submission, log);
+
+    // Add "PENDING CREDIT APPROVAL" comment
+    await addPendingCreditComment(customerId, submission, log);
 
     // Handle document upload (non-blocking)
     let documentUploaded = false;
     let documentLocation: string | undefined;
 
-    try {
-      const docHandler = getDocumentHandler();
-      const docResult = await docHandler.uploadAgreement(
-        submission.submissionId,
-        customer.id,
-        submission.company.legalName,
-        submission.signature.signatureDate
-      );
-
-      documentUploaded = docResult.success;
-      documentLocation = docResult.location;
-
-      if (!docResult.success) {
-        await alertDocumentUploadFailure(
+    const config = getConfig();
+    if (config.features.documentUpload && submission.signature.signed) {
+      try {
+        const docHandler = getDocumentHandler();
+        const docResult = await docHandler.uploadAgreement(
           submission.submissionId,
-          customer.id,
+          customerId,
           submission.company.legalName,
-          docResult.error || 'Unknown error'
+          submission.signature.signatureDate
+        );
+
+        documentUploaded = docResult.success;
+        documentLocation = docResult.location;
+
+        if (!docResult.success) {
+          await alertDocumentUploadFailure(
+            submission.submissionId,
+            customerId,
+            submission.company.legalName,
+            docResult.error || 'Unknown error'
+          );
+        }
+      } catch (docError) {
+        log.error(
+          'document_upload_error',
+          docError instanceof Error ? docError.message : 'Unknown error'
         );
       }
-    } catch (docError) {
-      log.error(
-        'document_upload_error',
-        docError instanceof Error ? docError.message : 'Unknown error'
-      );
     }
 
     // Mark as completed
-    idempotencyStore.markCompleted(submission.submissionId, customer.id);
+    await idempotencyStore.markCompleted(submission.submissionId, customerId);
 
     op.end(true, undefined, {
-      mcleodCustomerId: customer.id,
+      mcleodCustomerId: customerId,
       created,
       documentUploaded,
     });
 
     return {
       success: true,
-      customerId: customer.id,
+      customerId,
       created,
       documentUploaded,
       documentLocation,
@@ -115,7 +144,7 @@ export async function processSubmission(
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
-    idempotencyStore.markFailed(submission.submissionId, errorMessage);
+    await idempotencyStore.markFailed(submission.submissionId, errorMessage);
 
     await alertProcessingFailure(
       submission.submissionId,
@@ -140,37 +169,65 @@ export async function processSubmission(
 async function findOrCreateCustomer(
   submission: NormalizedSubmission,
   log: ReturnType<typeof logger.withSubmission>
-): Promise<{ customer: McLeodCustomer; created: boolean }> {
+): Promise<{ customerId: string; created: boolean }> {
   const mcleodClient = getMcLeodClient();
 
-  // Try to find by EIN first
-  let existing = await mcleodClient.findCustomerByEIN(submission.company.ein);
+  // Try to find by EIN first (most reliable)
+  log.info('searching_by_ein', { ein: submission.company.ein });
 
-  if (existing) {
-    log.info('customer_found_by_ein', {
-      mcleodCustomerId: existing.id,
-      ein: submission.company.ein,
+  try {
+    const einResult = await mcleodClient.searchCustomers({
+      'customer.federal_id': submission.company.ein,
     });
 
-    const updated = await updateExistingCustomer(existing, submission);
-    return { customer: updated, created: false };
+    if (einResult.customers.length > 0) {
+      const existing = einResult.customers[0];
+      log.info('customer_found_by_ein', {
+        mcleodCustomerId: existing.id,
+        ein: submission.company.ein,
+      });
+
+      await updateExistingCustomer(existing.id!, submission, log);
+      return { customerId: existing.id!, created: false };
+    }
+  } catch (searchError) {
+    log.warn('ein_search_failed', searchError instanceof Error ? searchError.message : 'Unknown');
   }
 
-  // Fallback: search by name + address
-  existing = await mcleodClient.findCustomerByNameAddress(
-    submission.company.legalName,
-    submission.company.address.city,
-    submission.company.address.state
-  );
+  // Fallback: search by name + city + state
+  log.info('searching_by_name_address', {
+    name: submission.company.legalName,
+    city: submission.company.address.city,
+    state: submission.company.address.state,
+  });
 
-  if (existing) {
-    log.info('customer_found_by_name_address', {
-      mcleodCustomerId: existing.id,
-      name: submission.company.legalName,
+  try {
+    const nameResult = await mcleodClient.searchCustomers({
+      'customer.name': submission.company.legalName,
+      'customer.city': submission.company.address.city,
+      'customer.state': submission.company.address.state,
     });
 
-    const updated = await updateExistingCustomer(existing, submission);
-    return { customer: updated, created: false };
+    if (nameResult.customers.length > 0) {
+      // Find exact match
+      const normalizedName = submission.company.legalName.toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const exactMatch = nameResult.customers.find((c) => {
+        const customerName = (c.name || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+        return customerName === normalizedName;
+      });
+
+      if (exactMatch) {
+        log.info('customer_found_by_name_address', {
+          mcleodCustomerId: exactMatch.id,
+          name: submission.company.legalName,
+        });
+
+        await updateExistingCustomer(exactMatch.id!, submission, log);
+        return { customerId: exactMatch.id!, created: false };
+      }
+    }
+  } catch (searchError) {
+    log.warn('name_search_failed', searchError instanceof Error ? searchError.message : 'Unknown');
   }
 
   // Create new customer
@@ -179,15 +236,34 @@ async function findOrCreateCustomer(
     ein: submission.company.ein,
   });
 
-  const newCustomer = await createNewCustomer(submission);
-  return { customer: newCustomer, created: true };
+  const customerId = await createNewCustomer(submission, log);
+  return { customerId, created: true };
 }
 
 /**
  * Create new customer in McLeod
  */
-async function createNewCustomer(submission: NormalizedSubmission): Promise<McLeodCustomer> {
+async function createNewCustomer(
+  submission: NormalizedSubmission,
+  log: ReturnType<typeof logger.withSubmission>
+): Promise<string> {
   const mcleodClient = getMcLeodClient();
+
+  // Get default customer template from McLeod
+  let customerDefaults: RowCustomer;
+  try {
+    customerDefaults = await mcleodClient.getCustomerDefaults();
+    log.info('got_customer_defaults', { fieldCount: Object.keys(customerDefaults).length });
+  } catch (defaultsError) {
+    log.warn('get_defaults_failed', 'Using minimal customer structure');
+    customerDefaults = {
+      name: '',
+      address1: '',
+      city: '',
+      state: '',
+      zip_code: '',
+    };
+  }
 
   // Generate unique customer ID
   const baseId = generateCustomerId(submission.company.ein, submission.company.legalName);
@@ -199,58 +275,59 @@ async function createNewCustomer(submission: NormalizedSubmission): Promise<McLe
     submission.salesperson.lastName
   );
 
-  // Build customer record
-  const customer: McLeodCustomer = {
-    id: customerId,
-    name: submission.company.legalName.toUpperCase(),
-    dba_name: submission.company.dba || undefined,
+  // Alert if salesperson not found
+  if (!isSalespersonFound(salespersonId)) {
+    log.warn('salesperson_not_found', submission.salesperson.fullName);
+    await alertSalespersonNotFound(
+      submission.submissionId,
+      submission.company.legalName,
+      submission.salesperson.fullName
+    );
+  }
 
-    // Address
+  // Build customer record starting from defaults
+  const customer: RowCustomer = {
+    ...customerDefaults,
+
+    // Customer ID
+    id: customerId,
+
+    // Company info
+    name: submission.company.legalName.toUpperCase(),
+    name2: submission.company.dba || undefined,
     address1: submission.company.address.street,
     address2: submission.company.address.street2 || undefined,
     city: submission.company.address.city.toUpperCase(),
     state: submission.company.address.state,
     zip_code: submission.company.address.zip,
+    country_code: 'USA',
 
     // Contact
-    phone: submission.company.phone,
+    phone1: submission.company.phone,
     email: submission.company.operationsEmail,
 
     // Tax/Regulatory
     federal_id: submission.company.ein,
-    mc_number: submission.company.mcNumber || undefined,
-    dot_number: submission.company.dotNumber || undefined,
+    ic_number: submission.company.mcNumber || undefined,
 
-    // Status - Always ACTIVE, but credit on HOLD
-    status: 'ACTIVE',
-    category: 'SHIPPER',
+    // Status - Active but no credit
+    status: 'A',
 
-    // Credit - NO CREDIT until manual approval
+    // Credit - NO CREDIT AWARDED (pending approval)
     credit_limit: 0,
-    credit_status: 'HOLD',
-    credit_approved: false,
+    credit_status: 'H', // Hold
 
-    // Payment
-    payment_terms: mapPaymentTerms(submission.billing.paymentTerms),
+    // Payment terms
+    terms: mapPaymentTerms(submission.billing.paymentTerms),
 
     // Salesperson
     salesperson_id: salespersonId,
 
-    // Contact fields (if McLeod uses embedded contacts)
+    // Primary contact name
     contact_name: `${submission.contacts.logistics.firstName} ${submission.contacts.logistics.lastName}`,
-    contact_email: submission.contacts.logistics.email,
-    contact_phone: submission.contacts.logistics.phone,
-
-    // AP Contact (if McLeod has dedicated fields)
-    ap_contact_name: `${submission.contacts.accountsPayable.firstName} ${submission.contacts.accountsPayable.lastName}`,
-    ap_email: submission.contacts.accountsPayable.email,
-    ap_phone: submission.contacts.accountsPayable.phone,
-
-    // Notes with detailed onboarding info
-    notes: buildCustomerNotes(submission),
 
     // Audit
-    created_by: 'JOTFORM_API',
+    entered_user_id: 'JOTFORM_API',
   };
 
   // Create in McLeod
@@ -260,23 +337,39 @@ async function createNewCustomer(submission: NormalizedSubmission): Promise<McLe
     throw new Error(`Failed to create customer: ${response.error?.message}`);
   }
 
-  return customer;
+  log.info('customer_created', {
+    mcleodCustomerId: customerId,
+    salespersonId,
+    creditLimit: 0,
+  });
+
+  return customerId;
 }
 
 /**
  * Update existing customer with new submission data
  */
 async function updateExistingCustomer(
-  existing: McLeodCustomer,
-  submission: NormalizedSubmission
-): Promise<McLeodCustomer> {
+  customerId: string,
+  submission: NormalizedSubmission,
+  log: ReturnType<typeof logger.withSubmission>
+): Promise<void> {
   const mcleodClient = getMcLeodClient();
 
-  // Build update payload - be careful not to overwrite important fields
-  const updates: Partial<McLeodCustomer> = {
+  // Get existing customer to preserve important fields
+  const existing = await mcleodClient.getCustomerById(customerId);
+  if (!existing) {
+    throw new Error(`Customer ${customerId} not found for update`);
+  }
+
+  // Build update - preserve credit settings, only update contact/address info
+  const updatePayload: RowCustomer = {
+    ...existing,
+    id: customerId,
+
     // Update contact info
     email: submission.company.operationsEmail,
-    phone: submission.company.phone,
+    phone1: submission.company.phone,
 
     // Update address
     address1: submission.company.address.street,
@@ -286,70 +379,126 @@ async function updateExistingCustomer(
     zip_code: submission.company.address.zip,
 
     // Add DBA if provided and not already set
-    dba_name: submission.company.dba || existing.dba_name,
+    name2: submission.company.dba || existing.name2,
 
-    // Update MC/DOT if provided
-    mc_number: submission.company.mcNumber || existing.mc_number,
-    dot_number: submission.company.dotNumber || existing.dot_number,
+    // Update MC number if provided
+    ic_number: submission.company.mcNumber || existing.ic_number,
 
-    // Update contacts
+    // Update primary contact
     contact_name: `${submission.contacts.logistics.firstName} ${submission.contacts.logistics.lastName}`,
-    contact_email: submission.contacts.logistics.email,
-    contact_phone: submission.contacts.logistics.phone,
-    ap_contact_name: `${submission.contacts.accountsPayable.firstName} ${submission.contacts.accountsPayable.lastName}`,
-    ap_email: submission.contacts.accountsPayable.email,
-    ap_phone: submission.contacts.accountsPayable.phone,
-
-    // Audit
-    modified_by: 'JOTFORM_API',
   };
-
-  // NEVER reduce credit limit or change status from ACTIVE
-  // Only set credit fields if they're currently null/undefined
-  if (existing.credit_limit === undefined || existing.credit_limit === null) {
-    updates.credit_limit = 0;
-    updates.credit_status = 'HOLD';
-  }
 
   // Only update salesperson if not already set
   if (!existing.salesperson_id) {
-    updates.salesperson_id = getSalespersonId(
+    const salespersonId = getSalespersonId(
       submission.salesperson.firstName,
       submission.salesperson.lastName
     );
+    updatePayload.salesperson_id = salespersonId;
+
+    if (!isSalespersonFound(salespersonId)) {
+      await alertSalespersonNotFound(
+        submission.submissionId,
+        submission.company.legalName,
+        submission.salesperson.fullName
+      );
+    }
   }
 
+  // NEVER reduce credit limit or change status
+  // Preserve existing credit settings
+  updatePayload.credit_limit = existing.credit_limit;
+  updatePayload.credit_status = existing.credit_status;
+
   // Update in McLeod
-  const response = await mcleodClient.updateCustomer(existing.id, updates);
+  const response = await mcleodClient.updateCustomer(updatePayload);
 
   if (!response.success) {
     throw new Error(`Failed to update customer: ${response.error?.message}`);
   }
 
-  // Append note about update
-  await mcleodClient.appendNote(
-    existing.id,
-    buildUpdateNote(submission)
-  );
-
-  // Return merged customer
-  return {
-    ...existing,
-    ...updates,
-  } as McLeodCustomer;
+  log.info('customer_updated', {
+    mcleodCustomerId: customerId,
+    preservedCreditLimit: existing.credit_limit,
+  });
 }
 
 /**
- * Build comprehensive notes for new customer
+ * Create contacts for the customer
  */
-function buildCustomerNotes(submission: NormalizedSubmission): string {
+async function createContacts(
+  customerId: string,
+  submission: NormalizedSubmission,
+  log: ReturnType<typeof logger.withSubmission>
+): Promise<void> {
+  const mcleodClient = getMcLeodClient();
+
+  // Create Logistics contact
+  const logisticsContact: RowContact = {
+    row_type: 'C',
+    parent_row_id: customerId,
+    first_name: submission.contacts.logistics.firstName,
+    last_name: submission.contacts.logistics.lastName,
+    name: `${submission.contacts.logistics.firstName} ${submission.contacts.logistics.lastName}`,
+    email: submission.contacts.logistics.email,
+    phone: submission.contacts.logistics.phone,
+    contact_type_id: 'LOGISTICS',
+    is_primary: true,
+  };
+
+  try {
+    const logResult = await mcleodClient.createContact(logisticsContact);
+    if (logResult.success) {
+      log.info('logistics_contact_created', { contactId: logResult.data?.contactId });
+    } else {
+      log.warn('logistics_contact_failed', logResult.error?.message || 'Unknown');
+    }
+  } catch (contactError) {
+    log.warn('logistics_contact_error', contactError instanceof Error ? contactError.message : 'Unknown');
+  }
+
+  // Create AP contact
+  const apContact: RowContact = {
+    row_type: 'C',
+    parent_row_id: customerId,
+    first_name: submission.contacts.accountsPayable.firstName,
+    last_name: submission.contacts.accountsPayable.lastName,
+    name: `${submission.contacts.accountsPayable.firstName} ${submission.contacts.accountsPayable.lastName}`,
+    email: submission.contacts.accountsPayable.email,
+    phone: submission.contacts.accountsPayable.phone,
+    contact_type_id: 'AP',
+    is_primary: false,
+  };
+
+  try {
+    const apResult = await mcleodClient.createContact(apContact);
+    if (apResult.success) {
+      log.info('ap_contact_created', { contactId: apResult.data?.contactId });
+    } else {
+      log.warn('ap_contact_failed', apResult.error?.message || 'Unknown');
+    }
+  } catch (contactError) {
+    log.warn('ap_contact_error', contactError instanceof Error ? contactError.message : 'Unknown');
+  }
+}
+
+/**
+ * Add "PENDING CREDIT APPROVAL" comment to customer
+ */
+async function addPendingCreditComment(
+  customerId: string,
+  submission: NormalizedSubmission,
+  log: ReturnType<typeof logger.withSubmission>
+): Promise<void> {
+  const mcleodClient = getMcLeodClient();
+
   const signedDate = submission.signature.signatureDate
     ? submission.signature.signatureDate.toISOString().split('T')[0]
     : 'N/A';
 
-  return `
+  const commentText = `
 ════════════════════════════════════════════════════
-⚠️  PENDING CREDIT APPROVAL
+⚠️  PENDING CREDIT APPROVAL — DO NOT EXTEND TERMS
 ════════════════════════════════════════════════════
 
 Created via Jotform onboarding on ${new Date().toISOString().split('T')[0]}
@@ -361,7 +510,7 @@ CREDIT LIMIT: $0.00
 ACTION REQUIRED:
 1. Billing team to run credit check
 2. Update credit_limit to approved amount
-3. Change credit_status to ACTIVE
+3. Change credit_status to A (Active)
 
 ────────────────────────────────────────────────────
 LOGISTICS CONTACT
@@ -391,20 +540,23 @@ AGREEMENT
 Signed: ${signedDate}
 Salesperson: ${submission.salesperson.fullName}
 `.trim();
-}
 
-/**
- * Build note for customer update
- */
-function buildUpdateNote(submission: NormalizedSubmission): string {
-  return `
-JOTFORM UPDATE - ${new Date().toISOString().split('T')[0]}
+  const comment: RowComment = {
+    row_type: 'C',
+    parent_row_id: customerId,
+    comment: commentText,
+    comment_type: 'JOTFORM',
+    entered_user_id: 'JOTFORM_API',
+  };
 
-New submission received (ID: ${submission.submissionId})
-Contact and address information updated.
-Salesperson: ${submission.salesperson.fullName}
-
-Logistics: ${submission.contacts.logistics.firstName} ${submission.contacts.logistics.lastName} (${submission.contacts.logistics.email})
-AP: ${submission.contacts.accountsPayable.firstName} ${submission.contacts.accountsPayable.lastName} (${submission.contacts.accountsPayable.email})
-`.trim();
+  try {
+    const result = await mcleodClient.createComment(comment);
+    if (result.success) {
+      log.info('pending_credit_comment_added', { commentId: result.data?.commentId });
+    } else {
+      log.warn('pending_credit_comment_failed', result.error?.message || 'Unknown');
+    }
+  } catch (commentError) {
+    log.warn('pending_credit_comment_error', commentError instanceof Error ? commentError.message : 'Unknown');
+  }
 }

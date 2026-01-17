@@ -7,6 +7,30 @@ export * from './alerting.js';
 export * from './idempotency.js';
 export * from './validators.js';
 
+// Re-export key functions for convenience
+export {
+  alertProcessingFailure,
+  alertDocumentUploadFailure,
+  alertProcessingSuccess,
+  alertSalespersonNotFound,
+} from './alerting.js';
+
+export {
+  idempotencyStore,
+  checkIdempotency,
+  generateContentHash,
+} from './idempotency.js';
+
+export {
+  generateCustomerId,
+  mapPaymentTerms,
+  normalizePhone,
+  normalizeEIN,
+  normalizeState,
+  normalizeZip,
+  normalizeSubmission,
+} from './validators.js';
+
 /**
  * Sleep utility for delays
  */

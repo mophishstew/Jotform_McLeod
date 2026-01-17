@@ -1,25 +1,32 @@
 # Jotform → McLeod TMS Integration
 
-Automated customer onboarding from Jotform submissions to McLeod TMS.
+Automated customer onboarding from Jotform submissions to McLeod TMS via REST API.
 
 ## Overview
 
 This service receives Jotform webhook submissions and creates/updates customer records in McLeod TMS with:
 
 - **Zero credit limit** (pending manual approval)
-- **Credit status set to HOLD**
+- **Credit status set to HOLD** (H)
 - Salesperson assignment based on form selection
-- Contact information (Logistics + AP)
-- Agreement document storage
+- Contact information (Logistics + AP) via ContactService
+- Agreement document storage via ImagingService
 - Idempotent processing (no duplicate customers)
+- "PENDING CREDIT APPROVAL" comment via CommentService
+
+**IMPORTANT:** McLeod uses REST API (NOT SOAP). All endpoints are under `/ws/api`.
 
 ## Architecture
 
 ```
-Jotform → Webhook → Azure Function → McLeod TMS
-                         ↓
-                  Document Storage
-                  (McLeod/Azure Blob)
+Jotform → Webhook → Azure Function → McLeod REST API
+                         ↓             (/ws/api)
+                    Idempotency          ↓
+                    (Azure Table)   CustomerService
+                         ↓          ContactService
+                  Document Storage  CommentService
+                  (McLeod Imaging   ImagingService
+                   / Azure Blob)
                          ↓
                    Slack Alerts
 ```
@@ -30,7 +37,7 @@ Jotform → Webhook → Azure Function → McLeod TMS
 
 - Node.js 18+
 - Azure Functions Core Tools v4
-- McLeod TMS Web Services access
+- McLeod TMS REST API access (under `/ws/api`)
 - Jotform API key
 
 ### Installation
@@ -45,10 +52,8 @@ npm install
 
 # Copy environment template
 cp .env.example .env
-cp local.settings.json.example local.settings.json
 
-# Edit configuration
-# Fill in your McLeod, Jotform, and Slack credentials
+# Edit configuration - fill in your credentials
 ```
 
 ### Local Development
@@ -60,16 +65,20 @@ npm run build
 # Start Azure Functions locally
 npm start
 
-# Test webhook endpoint
+# OR run standalone local server
+npm run start:local
+```
+
+### Test Webhook Endpoint
+
+```bash
+# Health check
+curl http://localhost:7071/api/health
+
+# Submit test payload
 curl -X POST http://localhost:7071/api/webhook/jotform \
   -H "Content-Type: application/json" \
   -d @test/sample-payload.json
-```
-
-### Running Tests
-
-```bash
-npm test
 ```
 
 ## Configuration
@@ -78,19 +87,25 @@ npm test
 
 | Variable | Description |
 |----------|-------------|
-| `MCLEOD_API_URL` | McLeod Web Services base URL |
-| `MCLEOD_USERNAME` | McLeod API username |
-| `MCLEOD_PASSWORD` | McLeod API password |
-| `JOTFORM_API_KEY` | Jotform API key |
+| `MCLEOD_BASE_URL` | McLeod REST API base URL (e.g., `https://tms.mcleodhosted.com/ws/api`) |
+| `MCLEOD_AUTH_MODE` | Auth mode: `token`, `basic`, or `login` |
+| `MCLEOD_USERNAME` | McLeod API username (for basic/login) |
+| `MCLEOD_PASSWORD` | McLeod API password (for basic/login) |
+| `MCLEOD_TOKEN` | Pre-existing token (for token auth mode) |
 
 ### Optional Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `MCLEOD_ANYWHERE_COMPANY_ID` | `TMS` | Company ID for multi-tenant |
+| `MCLEOD_AGREEMENT_DOCUMENT_TYPE_ID` | `AGREEMENT` | Doc type for uploads |
+| `JOTFORM_API_KEY` | - | Jotform API key |
 | `JOTFORM_WEBHOOK_SECRET` | - | Webhook signature secret |
 | `SLACK_WEBHOOK_URL` | - | Slack incoming webhook URL |
 | `ENABLE_SLACK_ALERTS` | `false` | Enable Slack notifications |
 | `ENABLE_DOCUMENT_UPLOAD` | `true` | Enable document storage |
+| `AZURE_TABLE_CONNECTION_STRING` | - | Azure Table for idempotency |
+| `AZURE_BLOB_CONNECTION_STRING` | - | Azure Blob for doc fallback |
 | `LOG_LEVEL` | `info` | Logging level |
 
 See `.env.example` for complete list.
@@ -101,13 +116,16 @@ See `.env.example` for complete list.
 
 Receives Jotform webhook payload and processes customer onboarding.
 
+**Request:** Jotform webhook JSON payload
+
 **Response:**
 ```json
 {
   "success": true,
   "customerId": "BB3456789",
   "created": true,
-  "documentUploaded": true
+  "documentUploaded": true,
+  "documentLocation": "McLeod Imaging: DOC123456"
 }
 ```
 
@@ -115,42 +133,71 @@ Receives Jotform webhook payload and processes customer onboarding.
 
 Health check endpoint.
 
-## Jotform Setup
+**Response:**
+```json
+{
+  "status": "healthy",
+  "service": "jotform-mcleod-integration",
+  "timestamp": "2024-01-15T10:30:00.000Z"
+}
+```
 
-1. **Configure Webhook:**
-   - Go to Jotform Form Builder → Settings → Integrations → Webhooks
-   - Add webhook URL: `https://your-function.azurewebsites.net/api/webhook/jotform`
-   - Enable webhook secret for security
+## McLeod REST API Integration
 
-2. **Required Form Fields:**
-   - Legal Company Name
-   - DBA
-   - Address (Street, City, State, Zip)
-   - Main Phone
-   - Operations Email
-   - EIN/Tax ID
-   - MC/DOT Number (optional)
-   - Logistics Contact (Name, Email, Phone)
-   - AP Contact (Name, Email, Phone)
-   - Payment Terms
-   - Invoice Delivery Preference
-   - Blackbox Contact (First Name, Last Name)
-   - Signature (Jotform Sign)
+### Endpoints Used
 
-## McLeod Integration
+Per the McLeod API documentation:
 
-### Customer ID Generation
+| Service | Endpoint | Method | Purpose |
+|---------|----------|--------|---------|
+| CustomerService | `/customers/new` | GET | Get default RowCustomer template |
+| CustomerService | `/customers/search` | GET | Search by EIN or name |
+| CustomerService | `/customers/{id}` | GET | Get customer by ID |
+| CustomerService | `/customers/create` | PUT | Create new customer |
+| CustomerService | `/customers/update` | PUT | Update existing customer |
+| ContactService | `/contacts/C/{customerId}` | GET | Get customer contacts |
+| ContactService | `/contacts/create` | PUT | Create contact |
+| CommentService | `/comments/create` | PUT | Create customer comment |
+| ImagingService | `/images/C/{customerId}/{docType}` | POST | Upload PDF |
+| UserService | `/users/login` | POST | Get auth token |
 
-Customer IDs are generated as: `BB` + last 7 digits of EIN
+### Authentication
 
-Example: EIN `12-3456789` → Customer ID `BB3456789`
+Three modes supported:
+
+1. **Token Mode:** Use pre-existing long-lived token
+   ```
+   MCLEOD_AUTH_MODE=token
+   MCLEOD_TOKEN=your_token
+   ```
+
+2. **Basic Mode:** Basic Auth on every request
+   ```
+   MCLEOD_AUTH_MODE=basic
+   MCLEOD_USERNAME=user
+   MCLEOD_PASSWORD=pass
+   ```
+
+3. **Login Mode (Recommended):** Get Bearer token via `/users/login`
+   ```
+   MCLEOD_AUTH_MODE=login
+   MCLEOD_USERNAME=user
+   MCLEOD_PASSWORD=pass
+   ```
+
+### Customer Matching Logic
+
+1. **Primary:** Search by EIN (`customer.federal_id`)
+2. **Fallback:** Search by name + city + state
+
+If found → UPDATE. If not found → CREATE.
 
 ### Credit Settings
 
 All new customers are created with:
 - `credit_limit`: 0
-- `credit_status`: HOLD
-- Notes: "PENDING CREDIT APPROVAL"
+- `credit_status`: H (Hold)
+- Comment: "PENDING CREDIT APPROVAL — DO NOT EXTEND TERMS"
 
 ### Salesperson Mapping
 
@@ -161,17 +208,116 @@ const SALESPERSON_MAP = {
   "Larry Dyer": "LDYER",
   "John Smith": "JSMITH",
   // Add your team
-  "_DEFAULT": "HOUSE"
+  "_DEFAULT": "UNASSIGNED"
 };
 ```
+
+Unknown salespeople trigger a Slack alert.
 
 ## Document Storage
 
 Signed agreements are stored in order of preference:
 
-1. **McLeod Document Service** (if available)
+1. **McLeod Imaging** (`POST /images/C/{customerId}/{documentTypeId}`)
 2. **Azure Blob Storage** (fallback)
-3. **Jotform URL in notes** (last resort)
+3. **Jotform URL in customer comment** (last resort)
+
+## Sandbox Validation Checklist
+
+Before production deployment, validate these scenarios:
+
+### Authentication Tests
+- [ ] **Test 1:** Verify `/users/login` returns token with valid credentials
+- [ ] **Test 2:** Verify authenticated requests work with Bearer token
+- [ ] **Test 3:** Verify 401 triggers token refresh and retry
+
+### Customer Operations
+- [ ] **Test 4:** `GET /customers/new` returns valid RowCustomer template
+- [ ] **Test 5:** Search by EIN returns matching customer
+- [ ] **Test 6:** Search by name+city+state returns matching customer
+- [ ] **Test 7:** `PUT /customers/create` successfully creates new customer
+- [ ] **Test 8:** `PUT /customers/update` preserves existing credit settings
+- [ ] **Test 9:** Verify credit_limit=0 and credit_status=H on new customers
+
+### Contact Operations
+- [ ] **Test 10:** `PUT /contacts/create` successfully creates Logistics contact
+- [ ] **Test 11:** `PUT /contacts/create` successfully creates AP contact
+
+### Comment Operations
+- [ ] **Test 12:** `PUT /comments/create` adds "PENDING CREDIT APPROVAL" comment
+
+### Document Operations
+- [ ] **Test 13:** `POST /images/C/{id}/{docType}` uploads PDF successfully
+- [ ] **Test 14:** Verify fallback to Azure Blob when McLeod Imaging fails
+
+### Idempotency Tests
+- [ ] **Test 15:** Duplicate submission returns existing customer, no new creation
+- [ ] **Test 16:** Azure Table Storage correctly stores/retrieves idempotency records
+
+### Alert Tests
+- [ ] **Test 17:** Processing failure sends Slack alert
+- [ ] **Test 18:** Unknown salesperson sends Slack alert
+- [ ] **Test 19:** Document upload failure sends Slack alert
+
+## Local Test Instructions
+
+### 1. Setup Environment
+
+```bash
+cp .env.example .env
+# Edit .env with your sandbox credentials
+```
+
+### 2. Run Tests
+
+```bash
+# Run unit tests
+npm test
+
+# Run integration tests (requires sandbox credentials)
+MCLEOD_BASE_URL=https://sandbox.mcleod.com/ws/api \
+MCLEOD_AUTH_MODE=login \
+MCLEOD_USERNAME=testuser \
+MCLEOD_PASSWORD=testpass \
+npm run test:integration
+```
+
+### 3. Manual Testing with cURL
+
+```bash
+# Get auth token
+curl -X POST https://your-mcleod.com/ws/api/users/login \
+  -u "username:password" \
+  -H "Content-Type: application/json"
+
+# Get customer defaults
+curl -X GET https://your-mcleod.com/ws/api/customers/new \
+  -H "Authorization: Bearer YOUR_TOKEN"
+
+# Search by EIN
+curl -X GET "https://your-mcleod.com/ws/api/customers/search?customer.federal_id=123456789" \
+  -H "Authorization: Bearer YOUR_TOKEN"
+
+# Create customer (example)
+curl -X PUT https://your-mcleod.com/ws/api/customers/create \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "TEST001",
+    "name": "TEST COMPANY",
+    "address1": "123 TEST ST",
+    "city": "DALLAS",
+    "state": "TX",
+    "zip_code": "75201",
+    "credit_limit": 0,
+    "credit_status": "H"
+  }'
+
+# Test webhook locally
+curl -X POST http://localhost:7071/api/webhook/jotform \
+  -H "Content-Type: application/json" \
+  -d @test/sample-payload.json
+```
 
 ## Deployment
 
@@ -182,30 +328,32 @@ Signed agreements are stored in order of preference:
 npm run build
 
 # Deploy using Azure CLI
-az functionapp deployment source config-zip \
-  -g <resource-group> \
-  -n <function-app-name> \
-  --src dist.zip
+func azure functionapp publish <function-app-name>
 
-# Or use VS Code Azure Functions extension
+# Or deploy using VS Code Azure Functions extension
 ```
 
 ### Environment Variables in Azure
-
-Set application settings in Azure Portal or via CLI:
 
 ```bash
 az functionapp config appsettings set \
   --name <function-app-name> \
   --resource-group <resource-group> \
-  --settings MCLEOD_API_URL=https://... MCLEOD_USERNAME=...
+  --settings \
+    MCLEOD_BASE_URL=https://tms.mcleodhosted.com/ws/api \
+    MCLEOD_AUTH_MODE=login \
+    MCLEOD_USERNAME=api_user \
+    MCLEOD_PASSWORD=@Microsoft.KeyVault(SecretUri=...) \
+    AZURE_TABLE_CONNECTION_STRING=@Microsoft.KeyVault(...) \
+    ENABLE_SLACK_ALERTS=true \
+    SLACK_WEBHOOK_URL=https://hooks.slack.com/...
 ```
 
 ## Monitoring
 
 ### Logs
 
-- Local: Console output
+- Local: Console output (JSON structured logs)
 - Azure: Application Insights
 
 ### Alerts
@@ -214,62 +362,50 @@ Failures trigger Slack notifications including:
 - Submission ID
 - Company name
 - Error message
+- McLeod endpoint that failed
 - Action required
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **Webhook signature validation fails**
-   - Verify `JOTFORM_WEBHOOK_SECRET` matches Jotform settings
-   - Or set `ENABLE_WEBHOOK_VALIDATION=false` for testing
-
-2. **McLeod connection fails**
-   - Verify `MCLEOD_API_URL` is correct
-   - Check credentials
+1. **401 Unauthorized**
+   - Verify credentials are correct
+   - Check auth mode setting
    - Ensure IP is whitelisted in McLeod
 
-3. **Duplicate customer ID**
-   - System auto-appends suffix (A, B, C...)
-   - Check logs for collision handling
+2. **Customer search returns empty**
+   - Verify query parameter format (`customer.federal_id`)
+   - Check if EIN format matches (no hyphens)
+
+3. **Document upload fails**
+   - Verify `MCLEOD_AGREEMENT_DOCUMENT_TYPE_ID` exists in McLeod
+   - Check file size limits
+   - Falls back to Azure Blob automatically
+
+4. **Duplicate customer created**
+   - Check if idempotency store is configured
+   - Set `AZURE_TABLE_CONNECTION_STRING` for production
 
 ## Project Structure
 
 ```
-├── docs/                    # Documentation
-│   ├── 01-MCLEOD-ENDPOINT-DISCOVERY.md
-│   ├── 02-FIELD-MAPPING-TABLE.md
-│   ├── 03-IDEMPOTENCY-AND-MATCHING.md
-│   ├── 04-CREDIT-HANDLING.md
-│   ├── 05-DOCUMENT-HANDLING.md
-│   └── 06-INTEGRATION-SPEC.md
 ├── src/
-│   ├── config/             # Configuration
+│   ├── config/             # Configuration + salesperson map
 │   ├── handlers/           # Azure Function handlers
-│   ├── services/           # Business logic
-│   │   ├── mcleod-client.ts    # McLeod API client (TODO: implement)
+│   ├── services/
+│   │   ├── mcleod-client.ts    # McLeod REST API client
 │   │   ├── jotform-client.ts   # Jotform API client
-│   │   ├── document-handler.ts # Document storage
+│   │   ├── document-handler.ts # Document storage (Imaging/Blob)
 │   │   └── customer-processor.ts # Main processing logic
-│   ├── types/              # TypeScript types
-│   ├── utils/              # Utilities
-│   └── index.ts            # Entry point
+│   ├── types/              # TypeScript types (RowCustomer, etc.)
+│   └── utils/              # Logging, alerting, idempotency
+├── test/
+│   └── sample-payload.json # Test webhook payload
 ├── .env.example            # Environment template
-├── host.json               # Azure Functions config
 ├── package.json
 └── tsconfig.json
 ```
-
-## TODO Before Production
-
-- [ ] Verify McLeod WSDL and update field names
-- [ ] Implement actual SOAP calls in `mcleod-client.ts`
-- [ ] Update Jotform field mappings in `types/jotform.ts`
-- [ ] Add all salespeople to mapping table
-- [ ] Configure Azure Blob Storage (if using)
-- [ ] Set up Application Insights
-- [ ] Test in sandbox environment
-- [ ] Review with Billing team
 
 ## Support
 

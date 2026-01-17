@@ -219,3 +219,23 @@ export async function alertProcessingSuccess(
       : 'Existing customer updated successfully',
   });
 }
+
+/**
+ * Send warning alert for salesperson not found
+ */
+export async function alertSalespersonNotFound(
+  submissionId: string,
+  companyName: string,
+  salespersonName: string
+): Promise<void> {
+  await sendSlackAlert({
+    level: 'warning',
+    service: 'jotform-mcleod-integration',
+    timestamp: new Date(),
+    submissionId,
+    companyName,
+    message: `Salesperson "${salespersonName}" not found in mapping`,
+    error: 'Using UNASSIGNED as default. Customer created but needs salesperson assignment.',
+    actionRequired: 'Update SALESPERSON_MAP in config or manually assign salesperson in McLeod.',
+  });
+}
