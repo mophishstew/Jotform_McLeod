@@ -5,18 +5,7 @@
 export * from './jotform.js';
 export * from './mcleod.js';
 
-/**
- * Idempotency record for tracking processed submissions
- */
-export interface IdempotencyRecord {
-  submissionId: string;
-  mcleodCustomerId: string | null;
-  status: 'processing' | 'completed' | 'failed';
-  createdAt: Date;
-  completedAt?: Date;
-  errorMessage?: string;
-  attempts: number;
-}
+// NOTE: IdempotencyRecord is defined in utils/idempotency.ts and exported from there
 
 /**
  * Processing result

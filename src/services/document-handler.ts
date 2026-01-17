@@ -2,10 +2,14 @@
  * Document handling service
  *
  * Handles storage of signed agreement PDFs
- * Tries multiple storage backends in order of preference:
- * 1. McLeod document upload (if supported)
- * 2. Azure Blob Storage (fallback)
- * 3. Jotform URL in notes (last resort)
+ *
+ * Strategy:
+ * Plan A: Upload directly to McLeod Imaging via ImagingService REST endpoint
+ *         POST /images/C/{customerId}/{documentTypeId}
+ *
+ * Plan B: Store in Azure Blob Storage and add link to customer comment
+ *
+ * Plan C: Store Jotform URL in customer comment (last resort)
  */
 
 import { getConfig } from '../config/index.js';
@@ -19,7 +23,7 @@ import { logger, sanitizeFilename, formatDate } from '../utils/index.js';
 export interface DocumentUploadResult {
   success: boolean;
   location: string;
-  method: 'MCLEOD_DIRECT' | 'AZURE_BLOB' | 'JOTFORM_LINK';
+  method: 'MCLEOD_IMAGING' | 'AZURE_BLOB' | 'JOTFORM_LINK';
   documentId?: string;
   error?: string;
 }
@@ -31,7 +35,7 @@ export class DocumentHandler {
   /**
    * Upload signed agreement document
    *
-   * Attempts multiple storage backends in order
+   * Attempts multiple storage backends in order of preference
    */
   async uploadAgreement(
     submissionId: string,
@@ -54,40 +58,67 @@ export class DocumentHandler {
     // Generate filename
     const filename = this.generateFilename(submissionId, customerName, signedDate);
 
-    // Try Plan A: McLeod direct upload
+    // Download PDF from Jotform first (needed for both Plan A and B)
+    let pdfBuffer: Buffer | null = null;
     try {
-      const result = await this.uploadToMcLeod(submissionId, customerId, filename);
-      if (result.success) {
-        return result;
-      }
-    } catch (error) {
+      const jotformClient = getJotformClient();
+      const { buffer } = await jotformClient.getSubmissionPdf(submissionId);
+      pdfBuffer = buffer;
+      logger.info('pdf_downloaded_from_jotform', { submissionId, fileSize: buffer.length });
+    } catch (downloadError) {
       logger.warn(
-        'mcleod_document_upload_failed',
-        error instanceof Error ? error.message : 'Unknown error'
+        'pdf_download_failed',
+        downloadError instanceof Error ? downloadError.message : 'Unknown error',
+        { submissionId }
       );
+      // Continue - we can still use Jotform link as fallback
     }
 
-    // Try Plan B: Azure Blob Storage
-    if (config.azure.storageConnectionString) {
+    // Plan A: McLeod Imaging direct upload
+    if (pdfBuffer) {
       try {
-        const result = await this.uploadToAzureBlob(submissionId, customerId, filename);
+        const result = await this.uploadToMcLeodImaging(
+          customerId,
+          pdfBuffer,
+          filename
+        );
         if (result.success) {
           return result;
         }
       } catch (error) {
         logger.warn(
-          'azure_document_upload_failed',
+          'mcleod_imaging_upload_failed',
           error instanceof Error ? error.message : 'Unknown error'
         );
       }
     }
 
-    // Plan C: Store Jotform URL in notes
+    // Plan B: Azure Blob Storage
+    if (pdfBuffer && config.azure.blobConnectionString) {
+      try {
+        const result = await this.uploadToAzureBlob(
+          submissionId,
+          customerId,
+          pdfBuffer,
+          filename
+        );
+        if (result.success) {
+          return result;
+        }
+      } catch (error) {
+        logger.warn(
+          'azure_blob_upload_failed',
+          error instanceof Error ? error.message : 'Unknown error'
+        );
+      }
+    }
+
+    // Plan C: Store Jotform URL in customer comment
     const jotformClient = getJotformClient();
     const jotformUrl = jotformClient.getSubmissionViewUrl(submissionId);
 
     try {
-      await this.storeDocumentLinkInNotes(customerId, jotformUrl);
+      await this.storeDocumentLinkInComment(customerId, jotformUrl, submissionId);
     } catch (error) {
       logger.error(
         'store_document_link_failed',
@@ -99,84 +130,83 @@ export class DocumentHandler {
       success: false,
       location: jotformUrl,
       method: 'JOTFORM_LINK',
-      error: 'All upload methods failed, stored Jotform URL in notes',
+      error: 'All upload methods failed, stored Jotform URL in comment',
     };
   }
 
   /**
-   * Upload document directly to McLeod
+   * Plan A: Upload document to McLeod Imaging
+   *
+   * Uses POST /images/C/{customerId}/{documentTypeId}
    */
-  private async uploadToMcLeod(
-    submissionId: string,
+  private async uploadToMcLeodImaging(
     customerId: string,
+    pdfBuffer: Buffer,
     filename: string
   ): Promise<DocumentUploadResult> {
-    const op = logger.startOperation('upload_to_mcleod');
+    const op = logger.startOperation('upload_to_mcleod_imaging');
+    const config = getConfig();
 
     try {
-      // Download PDF from Jotform
-      const jotformClient = getJotformClient();
-      const { buffer } = await jotformClient.getSubmissionPdf(submissionId);
-
-      // Upload to McLeod
       const mcleodClient = getMcLeodClient();
-      const response = await mcleodClient.uploadDocument({
-        entity_type: 'CUSTOMER',
-        entity_id: customerId,
-        document_type: 'AGREEMENT',
-        filename,
-        content_type: 'application/pdf',
-        content: buffer.toString('base64'),
-        description: 'Shipper/Broker Agreement - Jotform Sign',
-      });
+      const documentTypeId = config.mcleod.agreementDocumentTypeId;
+
+      const response = await mcleodClient.uploadCustomerAgreementPdf(
+        customerId,
+        documentTypeId,
+        pdfBuffer
+      );
 
       if (response.success && response.data) {
-        op.end(true, undefined, { documentId: response.data.documentId });
+        op.end(true, undefined, {
+          documentId: response.data.documentId,
+          filename,
+        });
+
         return {
           success: true,
-          location: `McLeod Document ID: ${response.data.documentId}`,
-          method: 'MCLEOD_DIRECT',
+          location: `McLeod Imaging: ${response.data.documentId}`,
+          method: 'MCLEOD_IMAGING',
           documentId: response.data.documentId,
         };
       }
 
-      throw new Error(response.error?.message || 'McLeod upload failed');
+      throw new Error(response.error?.message || 'McLeod Imaging upload failed');
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       op.end(false, errorMessage);
+
       return {
         success: false,
         location: '',
-        method: 'MCLEOD_DIRECT',
+        method: 'MCLEOD_IMAGING',
         error: errorMessage,
       };
     }
   }
 
   /**
-   * Upload document to Azure Blob Storage
-   *
-   * TODO: Implement actual Azure Blob upload
+   * Plan B: Upload document to Azure Blob Storage
    */
   private async uploadToAzureBlob(
     submissionId: string,
     customerId: string,
+    pdfBuffer: Buffer,
     filename: string
   ): Promise<DocumentUploadResult> {
     const op = logger.startOperation('upload_to_azure_blob');
+    const config = getConfig();
 
     try {
-      // TODO: Implement Azure Blob Storage upload
-      /*
-      const config = getConfig();
+      // Dynamic import Azure SDK
       const { BlobServiceClient } = await import('@azure/storage-blob');
 
       const blobServiceClient = BlobServiceClient.fromConnectionString(
-        config.azure.storageConnectionString
+        config.azure.blobConnectionString
       );
 
       const containerClient = blobServiceClient.getContainerClient(
-        config.azure.containerName
+        config.azure.blobContainerName
       );
 
       // Ensure container exists
@@ -184,35 +214,37 @@ export class DocumentHandler {
         access: 'blob',
       });
 
-      // Download PDF from Jotform
-      const jotformClient = getJotformClient();
-      const { buffer } = await jotformClient.getSubmissionPdf(submissionId);
+      // Upload blob
+      const blobName = `${customerId}/${filename}`;
+      const blobClient = containerClient.getBlockBlobClient(blobName);
 
-      // Upload to blob
-      const blobClient = containerClient.getBlockBlobClient(filename);
-      await blobClient.upload(buffer, buffer.length, {
-        blobHTTPHeaders: { blobContentType: 'application/pdf' },
+      await blobClient.upload(pdfBuffer, pdfBuffer.length, {
+        blobHTTPHeaders: {
+          blobContentType: 'application/pdf',
+        },
+        metadata: {
+          customerId,
+          submissionId,
+          uploadedAt: new Date().toISOString(),
+        },
       });
 
-      // Get blob URL
       const blobUrl = blobClient.url;
 
-      // Store link in McLeod notes
-      await this.storeDocumentLinkInNotes(customerId, blobUrl);
+      // Store link in McLeod comment
+      await this.storeDocumentLinkInComment(customerId, blobUrl, submissionId);
 
-      op.end(true, undefined, { blobUrl });
+      op.end(true, undefined, { blobUrl, blobName });
+
       return {
         success: true,
         location: blobUrl,
         method: 'AZURE_BLOB',
       };
-      */
-
-      // Placeholder - throw to indicate not implemented
-      throw new Error('Azure Blob upload not implemented');
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       op.end(false, errorMessage);
+
       return {
         success: false,
         location: '',
@@ -223,18 +255,29 @@ export class DocumentHandler {
   }
 
   /**
-   * Store document link in McLeod customer notes
+   * Store document link in McLeod customer comment
    */
-  private async storeDocumentLinkInNotes(
+  private async storeDocumentLinkInComment(
     customerId: string,
-    documentUrl: string
+    documentUrl: string,
+    submissionId: string
   ): Promise<void> {
     const mcleodClient = getMcLeodClient();
 
-    await mcleodClient.appendNote(
-      customerId,
-      `SIGNED AGREEMENT DOCUMENT:\n${documentUrl}`
-    );
+    const comment = `
+────────────────────────────────────────────────────
+SIGNED AGREEMENT DOCUMENT
+────────────────────────────────────────────────────
+Jotform Submission ID: ${submissionId}
+Document Location: ${documentUrl}
+Uploaded: ${new Date().toISOString()}
+
+Note: Document was stored externally.
+Access the URL above to view/download.
+────────────────────────────────────────────────────
+`.trim();
+
+    await mcleodClient.appendNote(customerId, comment);
   }
 
   /**
@@ -262,4 +305,11 @@ export function getDocumentHandler(): DocumentHandler {
     handlerInstance = new DocumentHandler();
   }
   return handlerInstance;
+}
+
+/**
+ * Reset handler (for testing)
+ */
+export function resetDocumentHandler(): void {
+  handlerInstance = null;
 }

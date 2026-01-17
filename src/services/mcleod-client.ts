@@ -1,105 +1,301 @@
 /**
- * McLeod TMS API Client
+ * McLeod TMS REST API Client
  *
- * This client handles all communication with McLeod TMS Web Services.
- * Currently implemented with placeholder functions - update with actual
- * SOAP calls after WSDL verification.
+ * CRITICAL: McLeod uses REST API, NOT SOAP.
+ * All endpoints are under /ws/api
  *
- * TODO: After obtaining McLeod WSDL:
- * 1. Update SOAP envelope structure
- * 2. Verify exact field names
- * 3. Implement actual SOAP calls using 'soap' library
- * 4. Add proper WS-Security if required
+ * Authentication:
+ * - POST /users/login with Basic Auth returns a token
+ * - Use Authorization: Bearer {token} for subsequent requests
+ *
+ * Customer endpoints (per CustomerService.md):
+ * - GET  /customers/new           - Get default RowCustomer template
+ * - GET  /customers/{id}          - Get customer by ID
+ * - GET  /customers/search        - Search customers with query params
+ * - PUT  /customers/create        - Create new customer (body: RowCustomer)
+ * - PUT  /customers/update        - Update customer (body: RowCustomer with id)
+ *
+ * Contact endpoints (per mcleod-api-reference.md):
+ * - GET  /contacts/C/{customerId} - Get contacts for customer
+ * - PUT  /contacts/create         - Create contact (body: RowContact)
+ *
+ * Comment endpoints:
+ * - PUT  /comments/create         - Create comment (body: RowComment)
+ *
+ * Imaging endpoints (per mcleod-api-reference.md):
+ * - POST /images/C/{customerId}/{documentTypeId} - Upload document
  */
 
 import { getConfig } from '../config/index.js';
-import { logger, withRetry } from '../utils/index.js';
+import { logger, withRetry, sleep } from '../utils/index.js';
 import type {
+  RowCustomer,
+  RowContact,
+  RowComment,
+  CustomerSearchParams,
+  CustomerSearchResult,
+  McLeodApiResponse,
+  LoginResponse,
   McLeodCustomer,
   McLeodSearchCriteria,
   McLeodSearchResult,
   McLeodDocument,
-  McLeodApiResponse,
 } from '../types/index.js';
 
 /**
- * McLeod API Client class
+ * HTTP methods supported
+ */
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
+
+/**
+ * McLeod REST API Client
  */
 export class McLeodClient {
-  private readonly apiUrl: string;
+  private readonly baseUrl: string;
   private readonly username: string;
   private readonly password: string;
   private readonly timeout: number;
+  private readonly authMode: 'token' | 'basic' | 'login';
+  private readonly companyId: string;
+
+  // Token caching
+  private token: string | null = null;
+  private tokenExpiresAt: number = 0;
 
   constructor() {
     const config = getConfig();
-    this.apiUrl = config.mcleod.apiUrl;
+    this.baseUrl = config.mcleod.baseUrl.replace(/\/$/, ''); // Remove trailing slash
     this.username = config.mcleod.username;
     this.password = config.mcleod.password;
     this.timeout = config.mcleod.timeout;
+    this.authMode = config.mcleod.authMode;
+    this.companyId = config.mcleod.companyId;
+
+    // If token provided via env, use it directly
+    if (config.mcleod.token) {
+      this.token = config.mcleod.token;
+      this.tokenExpiresAt = Date.now() + (24 * 60 * 60 * 1000); // Assume 24h for env token
+    }
   }
 
   /**
-   * Search for existing customer by criteria
-   *
-   * TODO: Implement actual SOAP call to CustomerService.SearchCustomers
-   *
-   * Expected SOAP operation: SearchCustomers or FindCustomer
-   * Required fields: criteria object with search parameters
-   * Returns: Array of matching customers
+   * Get or refresh authentication token
    */
-  async searchCustomers(criteria: McLeodSearchCriteria): Promise<McLeodSearchResult> {
-    const op = logger.startOperation('mcleod_search_customers');
+  private async getAuthToken(): Promise<string> {
+    // If using basic auth, return empty (auth header built differently)
+    if (this.authMode === 'basic') {
+      return '';
+    }
 
+    // Check if token is still valid (with 5 min buffer)
+    if (this.token && this.tokenExpiresAt > Date.now() + 300000) {
+      return this.token;
+    }
+
+    // If auth mode is 'token' and we have a token from env, use it
+    if (this.authMode === 'token' && this.token) {
+      return this.token;
+    }
+
+    // Login to get new token
+    const op = logger.startOperation('mcleod_login');
     try {
-      // TODO: Replace with actual SOAP implementation
-      // Example SOAP envelope structure:
-      /*
-      const envelope = `
-        <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-          <soap:Header>
-            <wsse:Security xmlns:wsse="...">
-              <wsse:UsernameToken>
-                <wsse:Username>${this.username}</wsse:Username>
-                <wsse:Password>${this.password}</wsse:Password>
-              </wsse:UsernameToken>
-            </wsse:Security>
-          </soap:Header>
-          <soap:Body>
-            <SearchCustomers xmlns="http://mcleod.com/webservices/customer">
-              <criteria>
-                ${criteria.federal_id ? `<federal_id>${criteria.federal_id}</federal_id>` : ''}
-                ${criteria.name ? `<name>${criteria.name}</name>` : ''}
-                ${criteria.city ? `<city>${criteria.city}</city>` : ''}
-                ${criteria.state ? `<state>${criteria.state}</state>` : ''}
-              </criteria>
-              <max_results>10</max_results>
-            </SearchCustomers>
-          </soap:Body>
-        </soap:Envelope>
-      `;
+      const credentials = Buffer.from(`${this.username}:${this.password}`).toString('base64');
 
-      const response = await fetch(`${this.apiUrl}/CustomerService`, {
+      const response = await fetch(`${this.baseUrl}/users/login`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'text/xml; charset=utf-8',
-          'SOAPAction': 'SearchCustomers',
+          'Authorization': `Basic ${credentials}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          ...(this.companyId && { 'X-Company-Id': this.companyId }),
         },
-        body: envelope,
         signal: AbortSignal.timeout(this.timeout),
       });
 
-      // Parse SOAP response and extract customers
-      */
+      if (!response.ok) {
+        throw new Error(`Login failed: ${response.status} ${response.statusText}`);
+      }
 
-      // Placeholder implementation - returns empty result
-      logger.warn('mcleod_search_not_implemented', 'Search not implemented - returning empty result');
+      const data = await response.json() as LoginResponse;
+      this.token = data.token;
+      // Default to 1 hour if no expiry provided
+      this.tokenExpiresAt = Date.now() + ((data.expiresIn || 3600) * 1000);
 
-      op.end(true, undefined, { criteria, resultCount: 0 });
+      op.end(true);
+      return this.token;
+    } catch (error) {
+      op.end(false, error instanceof Error ? error.message : 'Login failed');
+      throw error;
+    }
+  }
 
+  /**
+   * Build authorization header
+   */
+  private async getAuthHeader(): Promise<Record<string, string>> {
+    if (this.authMode === 'basic') {
+      const credentials = Buffer.from(`${this.username}:${this.password}`).toString('base64');
+      return { 'Authorization': `Basic ${credentials}` };
+    }
+
+    const token = await this.getAuthToken();
+    return { 'Authorization': `Bearer ${token}` };
+  }
+
+  /**
+   * Make an HTTP request to McLeod API with retries
+   */
+  private async request<T>(
+    method: HttpMethod,
+    endpoint: string,
+    body?: unknown,
+    contentType: string = 'application/json'
+  ): Promise<T> {
+    const url = `${this.baseUrl}${endpoint}`;
+
+    return withRetry(
+      async () => {
+        const authHeader = await this.getAuthHeader();
+
+        const headers: Record<string, string> = {
+          ...authHeader,
+          'Accept': 'application/json',
+          ...(this.companyId && { 'X-Company-Id': this.companyId }),
+        };
+
+        if (body && contentType !== 'application/pdf') {
+          headers['Content-Type'] = contentType;
+        }
+
+        const response = await fetch(url, {
+          method,
+          headers,
+          body: body ? (contentType === 'application/json' ? JSON.stringify(body) : body as BodyInit) : undefined,
+          signal: AbortSignal.timeout(this.timeout),
+        });
+
+        // Handle rate limiting
+        if (response.status === 429) {
+          const retryAfter = parseInt(response.headers.get('Retry-After') || '5', 10);
+          await sleep(retryAfter * 1000);
+          throw new Error('Rate limited, retrying');
+        }
+
+        // Handle auth errors - refresh token and retry
+        if (response.status === 401 && this.authMode !== 'basic') {
+          this.token = null;
+          this.tokenExpiresAt = 0;
+          throw new Error('Auth expired, retrying');
+        }
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`McLeod API error ${response.status}: ${errorText}`);
+        }
+
+        // Handle empty responses
+        const text = await response.text();
+        if (!text) {
+          return {} as T;
+        }
+
+        return JSON.parse(text) as T;
+      },
+      {
+        maxAttempts: 3,
+        initialDelayMs: 1000,
+        maxDelayMs: 10000,
+        shouldRetry: (error) => {
+          if (error instanceof Error) {
+            const msg = error.message.toLowerCase();
+            return (
+              msg.includes('rate limited') ||
+              msg.includes('auth expired') ||
+              msg.includes('429') ||
+              msg.includes('5') ||
+              msg.includes('timeout') ||
+              msg.includes('network') ||
+              msg.includes('econnreset')
+            );
+          }
+          return false;
+        },
+      }
+    );
+  }
+
+  // ============================================
+  // CustomerService REST Endpoints
+  // ============================================
+
+  /**
+   * GET /customers/new - Get default RowCustomer template
+   * Start with this to get the correct field structure
+   */
+  async getCustomerDefaults(): Promise<RowCustomer> {
+    const op = logger.startOperation('mcleod_get_customer_defaults');
+    try {
+      const result = await this.request<RowCustomer>('GET', '/customers/new');
+      op.end(true);
+      return result;
+    } catch (error) {
+      op.end(false, error instanceof Error ? error.message : 'Unknown error');
+      throw error;
+    }
+  }
+
+  /**
+   * GET /customers/search - Search customers by criteria
+   * Query params can use prefixes like customer.federal_id or no prefix
+   */
+  async searchCustomers(params: CustomerSearchParams): Promise<CustomerSearchResult> {
+    const op = logger.startOperation('mcleod_search_customers');
+    try {
+      // Build query string
+      const queryParams = new URLSearchParams();
+      for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined && value !== '') {
+          queryParams.append(key, value);
+        }
+      }
+
+      const endpoint = `/customers/search?${queryParams.toString()}`;
+      const result = await this.request<RowCustomer[]>('GET', endpoint);
+
+      // Response is typically an array of customers
+      const customers = Array.isArray(result) ? result : [];
+
+      op.end(true, undefined, { count: customers.length });
       return {
-        customers: [],
-        totalCount: 0,
+        customers,
+        totalCount: customers.length,
+        hasMore: false, // Pagination would need additional handling
+      };
+    } catch (error) {
+      op.end(false, error instanceof Error ? error.message : 'Unknown error');
+      throw error;
+    }
+  }
+
+  /**
+   * GET /customers?q={query} - Search customers by general query
+   * This is the confirmed working endpoint for searching by customer ID or name
+   * Use this for deterministic ID lookups and name-based searches
+   */
+  async searchCustomersByQuery(query: string): Promise<CustomerSearchResult> {
+    const op = logger.startOperation('mcleod_search_customers_by_query');
+    try {
+      const endpoint = `/customers?q=${encodeURIComponent(query)}`;
+      const result = await this.request<RowCustomer[]>('GET', endpoint);
+
+      // Response is typically an array of customers
+      const customers = Array.isArray(result) ? result : [];
+
+      op.end(true, undefined, { query, count: customers.length });
+      return {
+        customers,
+        totalCount: customers.length,
         hasMore: false,
       };
     } catch (error) {
@@ -109,161 +305,44 @@ export class McLeodClient {
   }
 
   /**
-   * Find customer by EIN/Tax ID
-   *
-   * Convenience method that searches by federal_id
+   * GET /customers/{id} - Get customer by ID
    */
-  async findCustomerByEIN(ein: string): Promise<McLeodCustomer | null> {
-    const result = await this.searchCustomers({ federal_id: ein });
-
-    if (result.customers.length === 0) {
-      return null;
-    }
-
-    if (result.customers.length > 1) {
-      logger.warn('multiple_customers_for_ein', `Found ${result.customers.length} customers for EIN ${ein}`);
-    }
-
-    // Return first active customer, or first customer if none active
-    return result.customers.find(c => c.status === 'ACTIVE') || result.customers[0];
-  }
-
-  /**
-   * Find customer by name and address
-   *
-   * Fallback search when EIN doesn't match
-   */
-  async findCustomerByNameAddress(
-    name: string,
-    city: string,
-    state: string
-  ): Promise<McLeodCustomer | null> {
-    const result = await this.searchCustomers({ name, city, state });
-
-    if (result.customers.length === 0) {
-      return null;
-    }
-
-    // Try to find exact name match
-    const normalizedName = name.toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const exactMatch = result.customers.find(c => {
-      const customerName = c.name.toUpperCase().replace(/[^A-Z0-9]/g, '');
-      return customerName === normalizedName;
-    });
-
-    return exactMatch || null;
-  }
-
-  /**
-   * Get customer by ID
-   *
-   * TODO: Implement actual SOAP call to CustomerService.GetCustomer
-   */
-  async getCustomer(customerId: string): Promise<McLeodCustomer | null> {
-    const op = logger.startOperation('mcleod_get_customer');
-
+  async getCustomerById(customerId: string): Promise<RowCustomer | null> {
+    const op = logger.startOperation('mcleod_get_customer_by_id');
     try {
-      // TODO: Replace with actual SOAP implementation
-      /*
-      const envelope = `
-        <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-          <soap:Header>...</soap:Header>
-          <soap:Body>
-            <GetCustomer xmlns="http://mcleod.com/webservices/customer">
-              <id>${customerId}</id>
-            </GetCustomer>
-          </soap:Body>
-        </soap:Envelope>
-      `;
-      */
-
-      logger.warn('mcleod_get_not_implemented', 'GetCustomer not implemented');
+      const result = await this.request<RowCustomer>('GET', `/customers/${encodeURIComponent(customerId)}`);
       op.end(true, undefined, { customerId });
-      return null;
+      return result;
     } catch (error) {
+      if (error instanceof Error && error.message.includes('404')) {
+        op.end(true, undefined, { customerId, found: false });
+        return null;
+      }
       op.end(false, error instanceof Error ? error.message : 'Unknown error');
       throw error;
     }
   }
 
   /**
-   * Create new customer in McLeod
-   *
-   * TODO: Implement actual SOAP call to CustomerService.CreateCustomer
-   *
-   * Expected SOAP operation: CreateCustomer or AddCustomer
-   * Required fields: id, name, address1, city, state, zip_code, status
-   * Returns: Created customer ID and success status
+   * PUT /customers/create - Create new customer
+   * Body must be a RowCustomer object
    */
-  async createCustomer(customer: McLeodCustomer): Promise<McLeodApiResponse<{ customerId: string }>> {
+  async createCustomer(customer: RowCustomer): Promise<McLeodApiResponse<{ customerId: string }>> {
     const op = logger.startOperation('mcleod_create_customer');
-
     try {
-      // TODO: Replace with actual SOAP implementation
-      /*
-      const envelope = `
-        <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-          <soap:Header>
-            <wsse:Security xmlns:wsse="...">
-              <wsse:UsernameToken>
-                <wsse:Username>${this.username}</wsse:Username>
-                <wsse:Password>${this.password}</wsse:Password>
-              </wsse:UsernameToken>
-            </wsse:Security>
-          </soap:Header>
-          <soap:Body>
-            <CreateCustomer xmlns="http://mcleod.com/webservices/customer">
-              <customer>
-                <id>${customer.id}</id>
-                <name>${customer.name}</name>
-                <dba_name>${customer.dba_name || ''}</dba_name>
-                <address1>${customer.address1}</address1>
-                <address2>${customer.address2 || ''}</address2>
-                <city>${customer.city}</city>
-                <state>${customer.state}</state>
-                <zip_code>${customer.zip_code}</zip_code>
-                <phone>${customer.phone || ''}</phone>
-                <email>${customer.email || ''}</email>
-                <federal_id>${customer.federal_id || ''}</federal_id>
-                <status>${customer.status}</status>
-                <category>${customer.category || 'SHIPPER'}</category>
-                <credit_limit>${customer.credit_limit}</credit_limit>
-                <credit_status>${customer.credit_status || 'HOLD'}</credit_status>
-                <salesperson_id>${customer.salesperson_id || ''}</salesperson_id>
-                <payment_terms>${customer.payment_terms || ''}</payment_terms>
-                <notes><![CDATA[${customer.notes || ''}]]></notes>
-              </customer>
-            </CreateCustomer>
-          </soap:Body>
-        </soap:Envelope>
-      `;
+      const result = await this.request<RowCustomer>('PUT', '/customers/create', customer);
 
-      const response = await fetch(`${this.apiUrl}/CustomerService`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'text/xml; charset=utf-8',
-          'SOAPAction': 'CreateCustomer',
-        },
-        body: envelope,
-        signal: AbortSignal.timeout(this.timeout),
-      });
+      // Response should include the created customer with ID
+      const customerId = result.id || customer.id || '';
 
-      // Parse response
-      */
-
-      // Placeholder - simulate success
-      logger.warn('mcleod_create_not_implemented', 'CreateCustomer not implemented - simulating success');
-
-      op.end(true, undefined, { customerId: customer.id });
-
+      op.end(true, undefined, { customerId });
       return {
         success: true,
-        data: { customerId: customer.id },
+        data: { customerId },
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       op.end(false, errorMessage);
-
       return {
         success: false,
         error: {
@@ -275,52 +354,23 @@ export class McLeodClient {
   }
 
   /**
-   * Update existing customer in McLeod
-   *
-   * TODO: Implement actual SOAP call to CustomerService.UpdateCustomer
-   *
-   * Expected SOAP operation: UpdateCustomer or ModifyCustomer
-   * Required fields: id (existing), plus fields to update
-   * Returns: Success status
+   * PUT /customers/update - Update existing customer
+   * Body must include customer.id
    */
-  async updateCustomer(
-    customerId: string,
-    updates: Partial<McLeodCustomer>
-  ): Promise<McLeodApiResponse<void>> {
+  async updateCustomer(customer: RowCustomer): Promise<McLeodApiResponse<void>> {
     const op = logger.startOperation('mcleod_update_customer');
-
     try {
-      // TODO: Replace with actual SOAP implementation
-      /*
-      const updateFields = Object.entries(updates)
-        .filter(([_, value]) => value !== undefined)
-        .map(([key, value]) => `<${key}>${escapeXml(String(value))}</${key}>`)
-        .join('\n');
+      if (!customer.id) {
+        throw new Error('Customer ID is required for update');
+      }
 
-      const envelope = `
-        <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-          <soap:Header>...</soap:Header>
-          <soap:Body>
-            <UpdateCustomer xmlns="http://mcleod.com/webservices/customer">
-              <id>${customerId}</id>
-              <updates>
-                ${updateFields}
-              </updates>
-            </UpdateCustomer>
-          </soap:Body>
-        </soap:Envelope>
-      `;
-      */
+      await this.request<RowCustomer>('PUT', '/customers/update', customer);
 
-      logger.warn('mcleod_update_not_implemented', 'UpdateCustomer not implemented - simulating success');
-
-      op.end(true, undefined, { customerId, updateFields: Object.keys(updates) });
-
+      op.end(true, undefined, { customerId: customer.id });
       return { success: true };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       op.end(false, errorMessage);
-
       return {
         success: false,
         error: {
@@ -331,86 +381,151 @@ export class McLeodClient {
     }
   }
 
+  // ============================================
+  // ContactService REST Endpoints
+  // ============================================
+
   /**
-   * Append note to customer record
-   *
-   * TODO: Implement based on McLeod note handling
-   * Some McLeod systems append to notes field, others have separate note table
+   * GET /contacts/C/{customerId} - Get contacts for a customer
+   * RowType "C" indicates customer contacts
    */
-  async appendNote(customerId: string, note: string): Promise<McLeodApiResponse<void>> {
-    const op = logger.startOperation('mcleod_append_note');
-
+  async getContacts(customerId: string): Promise<RowContact[]> {
+    const op = logger.startOperation('mcleod_get_contacts');
     try {
-      // Get existing customer to get current notes
-      const existing = await this.getCustomer(customerId);
-      const existingNotes = existing?.notes || '';
+      const result = await this.request<RowContact[]>('GET', `/contacts/C/${encodeURIComponent(customerId)}`);
+      const contacts = Array.isArray(result) ? result : [];
+      op.end(true, undefined, { customerId, count: contacts.length });
+      return contacts;
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('404')) {
+        op.end(true, undefined, { customerId, count: 0 });
+        return [];
+      }
+      op.end(false, error instanceof Error ? error.message : 'Unknown error');
+      throw error;
+    }
+  }
 
-      // Append new note with timestamp
-      const timestamp = new Date().toISOString();
-      const newNotes = existingNotes
-        ? `${existingNotes}\n\n--- ${timestamp} ---\n${note}`
-        : `--- ${timestamp} ---\n${note}`;
+  /**
+   * PUT /contacts/create - Create a new contact
+   * RowContact must include row_type: 'C' and parent_row_id (customer ID)
+   */
+  async createContact(contact: RowContact): Promise<McLeodApiResponse<{ contactId: string }>> {
+    const op = logger.startOperation('mcleod_create_contact');
+    try {
+      const result = await this.request<RowContact>('PUT', '/contacts/create', contact);
+      const contactId = result.id || '';
 
-      return await this.updateCustomer(customerId, { notes: newNotes });
+      op.end(true, undefined, { contactId, customerId: contact.parent_row_id });
+      return {
+        success: true,
+        data: { contactId },
+      };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       op.end(false, errorMessage);
-
       return {
         success: false,
         error: {
-          code: 'APPEND_NOTE_FAILED',
+          code: 'CREATE_CONTACT_FAILED',
           message: errorMessage,
         },
       };
     }
   }
 
+  // ============================================
+  // CommentService REST Endpoints
+  // ============================================
+
   /**
-   * Upload document to McLeod
-   *
-   * TODO: Implement actual SOAP call to DocumentService
-   *
-   * Expected SOAP operation: UploadDocument or AttachDocument
-   * Required fields: entity_type, entity_id, content (base64), filename
-   * Returns: Document ID
-   *
-   * If McLeod doesn't support document upload, this should throw
-   * and caller will fall back to external storage
+   * PUT /comments/create - Create a comment on a customer
+   * RowComment must include row_type: 'C' and parent_row_id (customer ID)
    */
-  async uploadDocument(document: McLeodDocument): Promise<McLeodApiResponse<{ documentId: string }>> {
-    const op = logger.startOperation('mcleod_upload_document');
-
+  async createComment(comment: RowComment): Promise<McLeodApiResponse<{ commentId: string }>> {
+    const op = logger.startOperation('mcleod_create_comment');
     try {
-      // TODO: Replace with actual SOAP implementation
-      /*
-      const envelope = `
-        <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-          <soap:Header>...</soap:Header>
-          <soap:Body>
-            <UploadDocument xmlns="http://mcleod.com/webservices/document">
-              <document>
-                <entity_type>${document.entity_type}</entity_type>
-                <entity_id>${document.entity_id}</entity_id>
-                <document_type>${document.document_type}</document_type>
-                <filename>${document.filename}</filename>
-                <content_type>${document.content_type}</content_type>
-                <content>${document.content}</content>
-                <description>${document.description || ''}</description>
-              </document>
-            </UploadDocument>
-          </soap:Body>
-        </soap:Envelope>
-      `;
-      */
+      const result = await this.request<RowComment>('PUT', '/comments/create', comment);
+      const commentId = result.id || '';
 
-      // Placeholder - throw to indicate not implemented
-      // This will trigger fallback to external storage
-      throw new Error('McLeod document upload not implemented - use fallback storage');
+      op.end(true, undefined, { commentId, customerId: comment.parent_row_id });
+      return {
+        success: true,
+        data: { commentId },
+      };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       op.end(false, errorMessage);
+      return {
+        success: false,
+        error: {
+          code: 'CREATE_COMMENT_FAILED',
+          message: errorMessage,
+        },
+      };
+    }
+  }
 
+  // ============================================
+  // ImagingService REST Endpoints
+  // ============================================
+
+  /**
+   * POST /images/C/{customerId}/{documentTypeId} - Upload a document
+   * Content-Type should be application/pdf (or appropriate type)
+   * Returns document ID on success
+   */
+  async uploadCustomerAgreementPdf(
+    customerId: string,
+    documentTypeId: string,
+    pdfBuffer: Buffer
+  ): Promise<McLeodApiResponse<{ documentId: string }>> {
+    const op = logger.startOperation('mcleod_upload_pdf');
+    try {
+      const endpoint = `/images/C/${encodeURIComponent(customerId)}/${encodeURIComponent(documentTypeId)}`;
+
+      // For PDF upload, we need to send raw binary with appropriate content-type
+      const url = `${this.baseUrl}${endpoint}`;
+      const authHeader = await this.getAuthHeader();
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          ...authHeader,
+          'Content-Type': 'application/pdf',
+          'Accept': 'application/json',
+          ...(this.companyId && { 'X-Company-Id': this.companyId }),
+        },
+        body: new Uint8Array(pdfBuffer),  // Convert Buffer to Uint8Array for fetch compatibility
+        signal: AbortSignal.timeout(this.timeout * 2), // Longer timeout for uploads
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Upload failed: ${response.status} ${errorText}`);
+      }
+
+      // Parse response for document ID
+      const text = await response.text();
+      let documentId = '';
+      if (text) {
+        try {
+          const data = JSON.parse(text);
+          documentId = data.id || data.document_id || data.imageId || '';
+        } catch {
+          // Response might just be the ID as text
+          documentId = text.trim();
+        }
+      }
+
+      op.end(true, undefined, { customerId, documentTypeId, documentId });
+      return {
+        success: true,
+        data: { documentId },
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      op.end(false, errorMessage);
       return {
         success: false,
         error: {
@@ -421,11 +536,72 @@ export class McLeodClient {
     }
   }
 
+  // ============================================
+  // Legacy compatibility methods
+  // ============================================
+
   /**
-   * Check if customer ID already exists
+   * Find customer by EIN (legacy interface)
+   * NOTE: Disabled until federal_id field is verified in GET /customers/new
+   */
+  async findCustomerByEIN(_ein: string): Promise<McLeodCustomer | null> {
+    // EIN matching disabled until field is verified
+    // TODO: Re-enable once federal_id field name is confirmed via GET /customers/new
+    logger.warn('find_customer_by_ein_disabled', 'EIN matching disabled - field not yet verified');
+    return null;
+  }
+
+  /**
+   * Find customer by name and address (legacy interface)
+   * Uses state_id instead of state per verified live response
+   */
+  async findCustomerByNameAddress(
+    name: string,
+    city: string,
+    state: string
+  ): Promise<McLeodCustomer | null> {
+    try {
+      const result = await this.searchCustomers({
+        'customer.name': name,
+        'customer.city': city,
+        'customer.state_id': state,  // NOTE: McLeod uses state_id, not state
+      });
+
+      if (result.customers.length === 0) {
+        return null;
+      }
+
+      // Try to find exact name match
+      const normalizedName = name.toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const exactMatch = result.customers.find((c) => {
+        const customerName = (c.name || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+        return customerName === normalizedName;
+      });
+
+      if (exactMatch) {
+        return this.rowToLegacyCustomer(exactMatch);
+      }
+
+      return null;
+    } catch (error) {
+      logger.warn('find_customer_by_name_failed', error instanceof Error ? error.message : 'Unknown');
+      return null;
+    }
+  }
+
+  /**
+   * Get customer by ID (legacy interface)
+   */
+  async getCustomer(customerId: string): Promise<McLeodCustomer | null> {
+    const row = await this.getCustomerById(customerId);
+    return row ? this.rowToLegacyCustomer(row) : null;
+  }
+
+  /**
+   * Check if customer ID exists
    */
   async customerIdExists(customerId: string): Promise<boolean> {
-    const customer = await this.getCustomer(customerId);
+    const customer = await this.getCustomerById(customerId);
     return customer !== null;
   }
 
@@ -457,6 +633,77 @@ export class McLeodClient {
 
     throw new Error(`Cannot generate unique customer ID from base: ${baseId}`);
   }
+
+  /**
+   * Legacy document upload (deprecated - use uploadCustomerAgreementPdf)
+   */
+  async uploadDocument(document: McLeodDocument): Promise<McLeodApiResponse<{ documentId: string }>> {
+    // This legacy method expects base64 content
+    // Convert to buffer and call new method
+    const config = getConfig();
+    const documentTypeId = config.mcleod.agreementDocumentTypeId;
+
+    if (!document.content) {
+      return {
+        success: false,
+        error: {
+          code: 'NO_CONTENT',
+          message: 'Document content is required',
+        },
+      };
+    }
+
+    const pdfBuffer = Buffer.from(document.content, 'base64');
+    return this.uploadCustomerAgreementPdf(document.entity_id, documentTypeId, pdfBuffer);
+  }
+
+  /**
+   * Append note to customer (legacy - now uses comments)
+   */
+  async appendNote(customerId: string, note: string): Promise<McLeodApiResponse<void>> {
+    const comment: RowComment = {
+      row_type: 'C',
+      parent_row_id: customerId,
+      comment: note,
+      entered_user_id: 'JOTFORM_API',
+    };
+
+    const result = await this.createComment(comment);
+    return {
+      success: result.success,
+      error: result.error,
+    };
+  }
+
+  /**
+   * Convert RowCustomer to legacy McLeodCustomer format
+   */
+  private rowToLegacyCustomer(row: RowCustomer): McLeodCustomer {
+    return {
+      id: row.id || '',
+      name: row.name,
+      dba_name: row.name2,
+      address1: row.address1,
+      address2: row.address2,
+      city: row.city,
+      state_id: row.state_id,  // NOTE: McLeod uses state_id, not state
+      zip_code: row.zip_code,
+      phone: row.phone1,
+      phone2: row.phone2,
+      fax: row.fax,
+      email: row.email,
+      federal_id: row.federal_id,
+      mc_number: row.ic_number,
+      status: row.status || 'A',
+      credit_limit: row.credit_limit || 0,
+      credit_status: row.credit_status,
+      payment_terms: row.terms,
+      salesperson_id: row.salesperson_id,
+      contact_name: row.contact_name,
+      created_by: row.entered_user_id,
+      created_date: row.entered_date,
+    };
+  }
 }
 
 /**
@@ -469,4 +716,11 @@ export function getMcLeodClient(): McLeodClient {
     clientInstance = new McLeodClient();
   }
   return clientInstance;
+}
+
+/**
+ * Reset client (for testing)
+ */
+export function resetMcLeodClient(): void {
+  clientInstance = null;
 }
