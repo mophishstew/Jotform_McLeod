@@ -313,9 +313,9 @@ async function createNewCustomer(
     // Status - Active but no credit
     status: 'A',
 
-    // Credit - NO CREDIT AWARDED (pending approval)
+    // Credit - TENTATIVE (pending approval, do not extend terms)
     credit_limit: 0,
-    credit_status: 'H', // Hold
+    credit_status: 'T', // Tentative - pending credit approval
 
     // Payment terms
     terms: mapPaymentTerms(submission.billing.paymentTerms),
@@ -405,10 +405,30 @@ async function updateExistingCustomer(
     }
   }
 
-  // NEVER reduce credit limit or change status
-  // Preserve existing credit settings
-  updatePayload.credit_limit = existing.credit_limit;
-  updatePayload.credit_status = existing.credit_status;
+  // Credit handling logic:
+  // - If customer is already Approved (A), NEVER change credit_status or credit_limit
+  // - If not Approved, preserve existing values (don't reduce or change without approval)
+  const isApproved = existing.credit_status === 'A';
+
+  if (isApproved) {
+    // Customer has approved credit - preserve everything
+    updatePayload.credit_limit = existing.credit_limit;
+    updatePayload.credit_status = existing.credit_status;
+    log.info('credit_preserved_approved', {
+      customerId,
+      creditLimit: existing.credit_limit,
+      creditStatus: 'A',
+    });
+  } else {
+    // Not approved - preserve existing settings (don't overwrite with Tentative)
+    updatePayload.credit_limit = existing.credit_limit;
+    updatePayload.credit_status = existing.credit_status;
+    log.info('credit_preserved_pending', {
+      customerId,
+      creditLimit: existing.credit_limit,
+      creditStatus: existing.credit_status,
+    });
+  }
 
   // Update in McLeod
   const response = await mcleodClient.updateCustomer(updatePayload);
@@ -420,6 +440,8 @@ async function updateExistingCustomer(
   log.info('customer_updated', {
     mcleodCustomerId: customerId,
     preservedCreditLimit: existing.credit_limit,
+    preservedCreditStatus: existing.credit_status,
+    wasApproved: isApproved,
   });
 }
 
@@ -504,13 +526,13 @@ async function addPendingCreditComment(
 Created via Jotform onboarding on ${new Date().toISOString().split('T')[0]}
 Jotform Submission ID: ${submission.submissionId}
 
-CREDIT STATUS: NOT APPROVED
+CREDIT STATUS: T (Tentative)
 CREDIT LIMIT: $0.00
 
 ACTION REQUIRED:
 1. Billing team to run credit check
 2. Update credit_limit to approved amount
-3. Change credit_status to A (Active)
+3. Change credit_status to A (Approved)
 
 ────────────────────────────────────────────────────
 LOGISTICS CONTACT

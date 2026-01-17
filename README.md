@@ -7,7 +7,7 @@ Automated customer onboarding from Jotform submissions to McLeod TMS via REST AP
 This service receives Jotform webhook submissions and creates/updates customer records in McLeod TMS with:
 
 - **Zero credit limit** (pending manual approval)
-- **Credit status set to HOLD** (H)
+- **Credit status set to TENTATIVE** (T) — do not extend terms
 - Salesperson assignment based on form selection
 - Contact information (Logistics + AP) via ContactService
 - Agreement document storage via ImagingService
@@ -194,10 +194,17 @@ If found → UPDATE. If not found → CREATE.
 
 ### Credit Settings
 
-All new customers are created with:
+Credit status codes in this McLeod instance:
+- **A** = Approved (credit approved, can extend terms)
+- **D** = Denied (credit denied, do not extend terms)
+- **T** = Tentative (pending approval, do not extend terms)
+
+All new customers from Jotform are created with:
 - `credit_limit`: 0
-- `credit_status`: H (Hold)
+- `credit_status`: T (Tentative)
 - Comment: "PENDING CREDIT APPROVAL — DO NOT EXTEND TERMS"
+
+**Important:** When updating existing customers, the integration will NOT overwrite `credit_status` or `credit_limit` if the customer is already Approved (A).
 
 ### Salesperson Mapping
 
@@ -236,8 +243,8 @@ Before production deployment, validate these scenarios:
 - [ ] **Test 5:** Search by EIN returns matching customer
 - [ ] **Test 6:** Search by name+city+state returns matching customer
 - [ ] **Test 7:** `PUT /customers/create` successfully creates new customer
-- [ ] **Test 8:** `PUT /customers/update` preserves existing credit settings
-- [ ] **Test 9:** Verify credit_limit=0 and credit_status=H on new customers
+- [ ] **Test 8:** `PUT /customers/update` preserves credit if already Approved (A)
+- [ ] **Test 9:** Verify credit_limit=0 and credit_status=T on new customers
 
 ### Contact Operations
 - [ ] **Test 10:** `PUT /contacts/create` successfully creates Logistics contact
@@ -310,7 +317,7 @@ curl -X PUT https://your-mcleod.com/ws/api/customers/create \
     "state": "TX",
     "zip_code": "75201",
     "credit_limit": 0,
-    "credit_status": "H"
+    "credit_status": "T"
   }'
 
 # Test webhook locally

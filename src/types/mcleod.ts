@@ -237,15 +237,22 @@ export interface McLeodApiResponse<T = unknown> {
 }
 
 /**
- * Valid credit status codes
+ * Valid credit status codes for this McLeod instance
+ * - A = Approved (credit approved, can extend terms)
+ * - D = Denied (credit denied, do not extend terms)
+ * - T = Tentative (pending approval, do not extend terms)
  */
 export const MCLEOD_CREDIT_STATUS = {
-  ACTIVE: 'A',
-  HOLD: 'H',
-  COD: 'COD',
-  PREPAID: 'P',
-  REVIEW: 'R',
+  APPROVED: 'A',
+  DENIED: 'D',
+  TENTATIVE: 'T',
 } as const;
+
+/**
+ * Credit status for new customers from Jotform
+ * Use TENTATIVE until billing runs credit check
+ */
+export const JOTFORM_DEFAULT_CREDIT_STATUS = MCLEOD_CREDIT_STATUS.TENTATIVE;
 
 /**
  * Valid customer status codes
