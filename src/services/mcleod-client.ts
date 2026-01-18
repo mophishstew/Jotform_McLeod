@@ -8,11 +8,11 @@
  * - POST /users/login with Basic Auth returns a token
  * - Use Authorization: Bearer {token} for subsequent requests
  *
- * Customer endpoints (per CustomerService.md):
+ * Customer endpoints:
  * - GET  /customers/new           - Get default RowCustomer template
  * - GET  /customers/{id}          - Get customer by ID
  * - GET  /customers/search        - Search customers with query params
- * - PUT  /customers/create        - Create new customer (body: RowCustomer)
+ * - POST /customers/create        - Create new customer (body: RowCustomer) - uses POST!
  * - PUT  /customers/update        - Update customer (body: RowCustomer with id)
  *
  * Contact endpoints (per mcleod-api-reference.md):
@@ -333,14 +333,30 @@ export class McLeodClient {
   }
 
   /**
-   * PUT /customers/create - Create new customer
-   * Body must be a RowCustomer object
-   * NOTE: McLeod may auto-generate customer ID based on name/city/state
+   * Create new customer in McLeod
+   *
+   * IMPORTANT: Uses POST not PUT for creation.
+   * - POST /customers or POST /customers/create - Creates new customer
+   * - PUT is typically for updates where client specifies ID
+   *
+   * When no ID is provided, McLeod auto-generates based on name/city/state
+   * Format: first 3 letters of name + first 2 of city + first of state
    */
   async createCustomer(customer: RowCustomer): Promise<McLeodApiResponse<{ customerId: string }>> {
     const op = logger.startOperation('mcleod_create_customer');
     try {
-      const result = await this.request<RowCustomer>('PUT', '/customers/create', customer);
+      // Log the full request payload for debugging
+      logger.info('mcleod_create_request', {
+        hasId: !!customer.id,
+        name: customer.name,
+        city: customer.city,
+        state_id: customer.state_id,
+        fieldCount: Object.keys(customer).length,
+      });
+
+      // Use POST for creating new customers (not PUT)
+      // This is critical - PUT may just validate without persisting
+      const result = await this.request<RowCustomer>('POST', '/customers/create', customer);
 
       // Log full response to see what McLeod actually returned
       logger.info('mcleod_create_response', {
@@ -348,6 +364,7 @@ export class McLeodClient {
         returnedId: result.id,
         returnedName: result.name,
         returnedFields: Object.keys(result),
+        fullResponse: JSON.stringify(result).slice(0, 500), // First 500 chars
       });
 
       // McLeod may return a different ID than what we sent (auto-generated)
@@ -360,6 +377,7 @@ export class McLeodClient {
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error('mcleod_create_error', errorMessage);
       op.end(false, errorMessage);
       return {
         success: false,
