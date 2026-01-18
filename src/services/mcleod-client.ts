@@ -306,12 +306,21 @@ export class McLeodClient {
 
   /**
    * GET /customers/{id} - Get customer by ID
+   * Returns null if customer doesn't exist (404 or empty response)
    */
   async getCustomerById(customerId: string): Promise<RowCustomer | null> {
     const op = logger.startOperation('mcleod_get_customer_by_id');
     try {
       const result = await this.request<RowCustomer>('GET', `/customers/${encodeURIComponent(customerId)}`);
-      op.end(true, undefined, { customerId });
+
+      // McLeod may return 200 with empty object instead of 404
+      // Check if we got actual customer data
+      if (!result || !result.id || Object.keys(result).length === 0) {
+        op.end(true, undefined, { customerId, found: false });
+        return null;
+      }
+
+      op.end(true, undefined, { customerId, found: true });
       return result;
     } catch (error) {
       if (error instanceof Error && error.message.includes('404')) {
