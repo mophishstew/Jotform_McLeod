@@ -184,8 +184,13 @@ async function findOrCreateCustomer(
 ): Promise<{ customerId: string; created: boolean }> {
   const mcleodClient = getMcLeodClient();
 
-  // Generate the deterministic customer ID we would use for creation
-  const baseId = generateCustomerId(submission.company.ein, submission.company.legalName);
+  // Generate McLeod-style customer ID for searching
+  // Format: first 3 letters of name + first 2 of city + first of state
+  const baseId = generateCustomerId(
+    submission.company.legalName,
+    submission.company.address.city,
+    submission.company.address.state
+  );
 
   // Strategy 1: Try deterministic customer ID lookup first
   // This checks if a customer with this exact ID already exists
@@ -290,6 +295,8 @@ async function findOrCreateCustomer(
 
 /**
  * Create new customer in McLeod
+ * NOTE: McLeod auto-generates customer ID based on name/city/state
+ * Format: first 3 letters of name + first 2 of city + first of state
  */
 async function createNewCustomer(
   submission: NormalizedSubmission,
@@ -313,10 +320,6 @@ async function createNewCustomer(
     };
   }
 
-  // Generate unique customer ID
-  const baseId = generateCustomerId(submission.company.ein, submission.company.legalName);
-  const customerId = await mcleodClient.generateUniqueCustomerId(baseId);
-
   // Look up salesperson
   const salespersonId = getSalespersonId(
     submission.salesperson.firstName,
@@ -334,11 +337,9 @@ async function createNewCustomer(
   }
 
   // Build customer record starting from defaults
+  // NOTE: Do NOT set id - let McLeod auto-generate it
   const customer: RowCustomer = {
     ...customerDefaults,
-
-    // Customer ID
-    id: customerId,
 
     // Company info
     name: submission.company.legalName.toUpperCase(),
@@ -378,11 +379,64 @@ async function createNewCustomer(
     entered_user_id: 'JOTFORM_API',
   };
 
-  // Create in McLeod
+  // Create in McLeod - it will auto-generate the customer ID
   const response = await mcleodClient.createCustomer(customer);
 
   if (!response.success) {
     throw new Error(`Failed to create customer: ${response.error?.message}`);
+  }
+
+  // McLeod returns empty response on create, so we need to find the customer
+  // Expected McLeod ID format: first 3 of name + first 2 of city + first of state
+  const expectedId = generateCustomerId(
+    submission.company.legalName,
+    submission.company.address.city,
+    submission.company.address.state
+  );
+
+  // Search for the customer we just created
+  let customerId = response.data?.customerId;
+
+  if (!customerId || customerId === '') {
+    log.info('searching_for_created_customer', { expectedId });
+
+    // Try to find by expected ID
+    const searchResult = await mcleodClient.searchCustomersByQuery(expectedId);
+
+    if (searchResult.customers.length > 0) {
+      // Find exact match by name
+      const normalizedName = submission.company.legalName.toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const match = searchResult.customers.find((c) => {
+        const cName = (c.name || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+        return cName === normalizedName || c.id?.startsWith(expectedId);
+      });
+
+      if (match && match.id) {
+        customerId = match.id;
+        log.info('found_created_customer', { customerId, expectedId });
+      }
+    }
+
+    // If still not found, try searching by name
+    if (!customerId) {
+      const nameSearch = await mcleodClient.searchCustomersByQuery(submission.company.legalName);
+      const normalizedName = submission.company.legalName.toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+      const match = nameSearch.customers.find((c) => {
+        const cName = (c.name || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+        const cityMatch = (c.city || '').toUpperCase() === submission.company.address.city.toUpperCase();
+        return cName === normalizedName && cityMatch;
+      });
+
+      if (match && match.id) {
+        customerId = match.id;
+        log.info('found_created_customer_by_name', { customerId });
+      }
+    }
+  }
+
+  if (!customerId) {
+    throw new Error(`Customer created but could not find it. Expected ID pattern: ${expectedId}`);
   }
 
   log.info('customer_created', {

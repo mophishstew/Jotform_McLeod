@@ -241,28 +241,28 @@ export function normalizeSubmission(payload: JotformWebhookPayload): NormalizedS
 }
 
 /**
- * Generate deterministic customer ID from EIN
+ * Generate McLeod-style customer ID for searching
+ * McLeod format: first 3 letters of name + first 2 of city + first of state
+ * Example: "Test Trucking LLC" in Dallas, TX -> "TESDAT"
  */
-export function generateCustomerId(ein: string, companyName: string): string {
-  // Primary: Use EIN (most unique)
-  if (ein && ein.length === 9) {
-    // Format: BB + last 7 digits of EIN
-    // "BB" prefix identifies Blackbox-created customers
-    return `BB${ein.slice(2)}`;
-  }
-
-  // Fallback: Use company name + date
-  const namePrefix = companyName
+export function generateCustomerId(companyName: string, city: string, state: string): string {
+  // Extract letters only, uppercase
+  const namePart = companyName
     .toUpperCase()
-    .replace(/[^A-Z0-9]/g, '')
-    .slice(0, 6);
+    .replace(/[^A-Z]/g, '')
+    .slice(0, 3);
 
-  const dateSuffix = new Date()
-    .toISOString()
-    .slice(2, 10)
-    .replace(/-/g, '');
+  const cityPart = city
+    .toUpperCase()
+    .replace(/[^A-Z]/g, '')
+    .slice(0, 2);
 
-  return `${namePrefix}${dateSuffix}`;
+  const statePart = state
+    .toUpperCase()
+    .replace(/[^A-Z]/g, '')
+    .slice(0, 1);
+
+  return `${namePart}${cityPart}${statePart}`;
 }
 
 /**
