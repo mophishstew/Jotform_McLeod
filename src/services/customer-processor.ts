@@ -607,6 +607,7 @@ async function createContacts(
     contact_name: `${submission.contacts.accountsPayable.firstName} ${submission.contacts.accountsPayable.lastName}`,
     email: submission.contacts.accountsPayable.email,
     phone: submission.contacts.accountsPayable.phone,
+    title: 'AP',               // Title for AP contacts
     is_active: 'Y',
     payable_contact: 'Y',      // Mark as AP contact
   };
