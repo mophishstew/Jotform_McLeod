@@ -418,6 +418,33 @@ export class McLeodClient {
   // ============================================
 
   /**
+   * GET /contacts/new/C/{customerId} - Get default contact template for a customer
+   * Similar to /customers/new, returns template with required fields
+   */
+  async getContactDefaults(customerId: string): Promise<RowContact> {
+    const op = logger.startOperation('mcleod_get_contact_defaults');
+    try {
+      const result = await this.request<RowContact>('GET', `/contacts/new/C/${encodeURIComponent(customerId)}`);
+      logger.info('contact_defaults_received', {
+        customerId,
+        fieldCount: Object.keys(result).length,
+        fields: Object.keys(result),
+      });
+      op.end(true, undefined, { customerId, fieldCount: Object.keys(result).length });
+      return result;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.warn('contact_defaults_failed', errorMessage);
+      op.end(false, errorMessage);
+      // Return minimal structure if defaults endpoint fails
+      return {
+        row_type: 'C',
+        parent_row_id: customerId,
+      };
+    }
+  }
+
+  /**
    * GET /contacts/C/{customerId} - Get contacts for a customer
    * RowType "C" indicates customer contacts
    */
@@ -441,12 +468,30 @@ export class McLeodClient {
   /**
    * PUT /contacts/create - Create a new contact
    * RowContact must include row_type: 'C' and parent_row_id (customer ID)
+   *
+   * IMPORTANT: Get contact defaults first and merge with your data
    */
   async createContact(contact: RowContact): Promise<McLeodApiResponse<{ contactId: string }>> {
     const op = logger.startOperation('mcleod_create_contact');
     try {
+      // Log what we're sending for debugging
+      logger.info('mcleod_create_contact_request', {
+        customerId: contact.parent_row_id,
+        name: contact.name,
+        email: contact.email,
+        phone: contact.phone,
+        contact_type_id: contact.contact_type_id,
+        fieldCount: Object.keys(contact).length,
+        fields: Object.keys(contact),
+      });
+
       const result = await this.request<RowContact>('PUT', '/contacts/create', contact);
       const contactId = result.id || '';
+
+      logger.info('mcleod_create_contact_response', {
+        contactId,
+        returnedFields: Object.keys(result),
+      });
 
       op.end(true, undefined, { contactId, customerId: contact.parent_row_id });
       return {
@@ -455,6 +500,7 @@ export class McLeodClient {
       };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error('mcleod_create_contact_error', errorMessage);
       op.end(false, errorMessage);
       return {
         success: false,

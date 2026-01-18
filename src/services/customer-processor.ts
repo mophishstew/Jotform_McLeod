@@ -549,6 +549,7 @@ async function updateExistingCustomer(
 
 /**
  * Create contacts for the customer
+ * Uses contact defaults from McLeod to ensure all required fields are present
  */
 async function createContacts(
   customerId: string,
@@ -557,8 +558,22 @@ async function createContacts(
 ): Promise<void> {
   const mcleodClient = getMcLeodClient();
 
-  // Create Logistics contact
+  // Get contact defaults from McLeod (like we do for customers)
+  let contactDefaults: RowContact;
+  try {
+    contactDefaults = await mcleodClient.getContactDefaults(customerId);
+    log.info('got_contact_defaults', { fieldCount: Object.keys(contactDefaults).length });
+  } catch (defaultsError) {
+    log.warn('get_contact_defaults_failed', 'Using minimal contact structure');
+    contactDefaults = {
+      row_type: 'C',
+      parent_row_id: customerId,
+    };
+  }
+
+  // Create Logistics contact - merge with defaults
   const logisticsContact: RowContact = {
+    ...contactDefaults,
     row_type: 'C',
     parent_row_id: customerId,
     first_name: submission.contacts.logistics.firstName,
@@ -581,8 +596,9 @@ async function createContacts(
     log.warn('logistics_contact_error', contactError instanceof Error ? contactError.message : 'Unknown');
   }
 
-  // Create AP contact
+  // Create AP contact - merge with defaults
   const apContact: RowContact = {
+    ...contactDefaults,
     row_type: 'C',
     parent_row_id: customerId,
     first_name: submission.contacts.accountsPayable.firstName,
