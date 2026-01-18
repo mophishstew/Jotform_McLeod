@@ -335,16 +335,25 @@ export class McLeodClient {
   /**
    * PUT /customers/create - Create new customer
    * Body must be a RowCustomer object
+   * NOTE: McLeod may auto-generate customer ID based on name/city/state
    */
   async createCustomer(customer: RowCustomer): Promise<McLeodApiResponse<{ customerId: string }>> {
     const op = logger.startOperation('mcleod_create_customer');
     try {
       const result = await this.request<RowCustomer>('PUT', '/customers/create', customer);
 
-      // Response should include the created customer with ID
+      // Log full response to see what McLeod actually returned
+      logger.info('mcleod_create_response', {
+        sentId: customer.id,
+        returnedId: result.id,
+        returnedName: result.name,
+        returnedFields: Object.keys(result),
+      });
+
+      // McLeod may return a different ID than what we sent (auto-generated)
       const customerId = result.id || customer.id || '';
 
-      op.end(true, undefined, { customerId });
+      op.end(true, undefined, { customerId, sentId: customer.id, returnedId: result.id });
       return {
         success: true,
         data: { customerId },
