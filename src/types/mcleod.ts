@@ -60,26 +60,35 @@ export interface RowCustomer {
 
 /**
  * McLeod RowContact structure for ContactService
- * RowType must be "C" for customer contacts
+ * Per McLeod API docs: PUT /contacts/create
  */
 export interface RowContact {
   // Required fields
-  id?: string;                     // Contact ID (auto-generated)
-  row_type: 'C';                   // C = Customer contact
-  parent_row_id: string;           // Customer ID
+  __type?: string;                 // 'contact'
+  company_id?: string;             // 'TMS'
+  id?: string;                     // Contact ID (auto-generated, max 32)
+  parent_row_id: string;           // Customer ID (max 8)
+  parent_row_type?: string;        // 'C' for customer contact (max 1)
+  row_type?: 'C';                  // Legacy - use parent_row_type
 
-  // Contact info
-  first_name?: string;
-  last_name?: string;
-  name?: string;                   // Full name if not split
-  email?: string;
-  phone?: string;
-  phone2?: string;
-  fax?: string;
+  // Contact info (per API spec)
+  name?: string;                   // Full name (max 40)
+  contact_name?: string;           // Contact name (max 40)
+  email?: string;                  // Email (max 60)
+  phone?: string;                  // Phone (max 20)
+  mobile_phone?: string;           // Mobile phone (max 20)
+  fax?: string;                    // Fax (max 20)
+  title?: string;                  // Title (max 30)
 
-  // Classification
-  contact_type_id?: string;        // Contact type (LOGISTICS, AP, PRIMARY, etc.)
-  is_primary?: boolean;            // Primary contact flag
+  // Classification flags (Y/N)
+  is_active?: string;              // Active flag (max 1)
+  payable_contact?: string;        // AP contact flag (max 1)
+  detention_contact?: string;      // Detention contact (max 1)
+  terms_contact?: string;          // Terms contact (max 1)
+
+  // Other fields
+  sequence?: number;               // Sequence number
+  comments?: string;               // Comments (max 254)
 
   // Allow additional fields
   [key: string]: unknown;

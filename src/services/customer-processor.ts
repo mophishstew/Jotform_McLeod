@@ -571,22 +571,18 @@ async function createContacts(
     };
   }
 
-  // Create Logistics contact - merge with defaults
-  // McLeod requires: __type, company_id, parentType, parent_row_id
+  // Create Logistics contact - per McLeod RowContact API spec
   const logisticsContact: RowContact = {
     ...contactDefaults,
     __type: 'contact',
     company_id: 'TMS',
-    parentType: 'C',           // Required - C = Customer contact
-    row_type: 'C',
+    parent_row_type: 'C',      // Required - C = Customer contact
     parent_row_id: customerId,
-    first_name: submission.contacts.logistics.firstName,
-    last_name: submission.contacts.logistics.lastName,
     name: `${submission.contacts.logistics.firstName} ${submission.contacts.logistics.lastName}`,
+    contact_name: `${submission.contacts.logistics.firstName} ${submission.contacts.logistics.lastName}`,
     email: submission.contacts.logistics.email,
     phone: submission.contacts.logistics.phone,
-    contact_type_id: 'LOGISTICS',
-    is_primary: true,
+    is_active: 'Y',
   };
 
   try {
@@ -600,22 +596,19 @@ async function createContacts(
     log.warn('logistics_contact_error', contactError instanceof Error ? contactError.message : 'Unknown');
   }
 
-  // Create AP contact - merge with defaults
-  // McLeod requires: __type, company_id, parentType, parent_row_id
+  // Create AP contact - per McLeod RowContact API spec
   const apContact: RowContact = {
     ...contactDefaults,
     __type: 'contact',
     company_id: 'TMS',
-    parentType: 'C',           // Required - C = Customer contact
-    row_type: 'C',
+    parent_row_type: 'C',      // Required - C = Customer contact
     parent_row_id: customerId,
-    first_name: submission.contacts.accountsPayable.firstName,
-    last_name: submission.contacts.accountsPayable.lastName,
     name: `${submission.contacts.accountsPayable.firstName} ${submission.contacts.accountsPayable.lastName}`,
+    contact_name: `${submission.contacts.accountsPayable.firstName} ${submission.contacts.accountsPayable.lastName}`,
     email: submission.contacts.accountsPayable.email,
     phone: submission.contacts.accountsPayable.phone,
-    contact_type_id: 'AP',
-    is_primary: false,
+    is_active: 'Y',
+    payable_contact: 'Y',      // Mark as AP contact
   };
 
   try {
