@@ -536,6 +536,7 @@ async function createContacts(
     name: `${submission.contacts.accountsPayable.firstName} ${submission.contacts.accountsPayable.lastName}`,
     email: submission.contacts.accountsPayable.email,
     phone: submission.contacts.accountsPayable.phone,
+    title: 'AP',
     contact_type_id: 'AP',
     is_primary: false,
   };
