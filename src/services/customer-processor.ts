@@ -572,8 +572,11 @@ async function createContacts(
   }
 
   // Create Logistics contact - merge with defaults
+  // Include __type and company_id which McLeod requires (seen in customer responses)
   const logisticsContact: RowContact = {
     ...contactDefaults,
+    __type: 'contact',
+    company_id: 'TMS',
     row_type: 'C',
     parent_row_id: customerId,
     first_name: submission.contacts.logistics.firstName,
@@ -597,8 +600,11 @@ async function createContacts(
   }
 
   // Create AP contact - merge with defaults
+  // Include __type and company_id which McLeod requires
   const apContact: RowContact = {
     ...contactDefaults,
+    __type: 'contact',
+    company_id: 'TMS',
     row_type: 'C',
     parent_row_id: customerId,
     first_name: submission.contacts.accountsPayable.firstName,
